@@ -1,0 +1,9 @@
+[package]
+name = "routerd"
+description = "Desktop engine daemon + tray helper (stub until S4)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]

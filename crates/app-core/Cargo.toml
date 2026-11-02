@@ -1,0 +1,9 @@
+[package]
+name = "app-core"
+description = "ControlApi, config persistence, UI view-models, IPC protocol (stub until S4)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]

@@ -1,0 +1,9 @@
+[package]
+name = "platform-io"
+description = "AudioBackend trait + mock | WASAPI | PipeWire | cpal | AAudio backends (stub until S4)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]

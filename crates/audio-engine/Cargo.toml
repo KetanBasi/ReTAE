@@ -1,0 +1,15 @@
+[package]
+name = "audio-engine"
+description = "RT mixer: port pool, strips, buses, DSP, drift resampling (PLAN.md §5, §7)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+audio-types.workspace = true
+rtrb.workspace = true
+# ? A normal (not dev) dependency because `process_block` wraps itself in
+# ? `assert_no_alloc` when `debug_assertions` is on. In release builds the wrapper
+# ? is compiled out by the crate itself.
+assert_no_alloc.workspace = true

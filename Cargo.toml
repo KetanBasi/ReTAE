@@ -1,0 +1,44 @@
+# SECTION: Workspace
+[workspace]
+resolver = "3"
+members = [
+    "crates/audio-types",
+    "crates/audio-engine",
+    "crates/net-vban",
+    "crates/platform-io",
+    "crates/app-core",
+    "crates/routerd",
+    "crates/router-ui",
+    "crates/router-cli",
+    "crates/android-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+# ? Versions are pinned once here; member crates say `dep.workspace = true`.
+# ? Each session adds only the crates it actually uses (see PLAN.md §10 for the full list).
+[workspace.dependencies]
+# * Workspace crates
+audio-types = { path = "crates/audio-types" }
+audio-engine = { path = "crates/audio-engine" }
+
+# * External crates
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "1.1.8"
+rtrb = "0.4.1"
+assert_no_alloc = "1.1.2"
+# !SECTION: Workspace
+
+# SECTION: Profiles
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# ? Keeps symbol names + line numbers in release binaries so profilers/backtraces are readable.
+debug = "line-tables-only"
+# !SECTION: Profiles
