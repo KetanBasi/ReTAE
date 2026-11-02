@@ -10,6 +10,9 @@ use core::sync::atomic::AtomicU32;
 pub struct EngineStats {
     /// Blocks where a strip's ring had fewer frames than the block needed (zero-filled).
     pub input_underruns: AtomicU32,
+    /// Times an externally clocked strip's FIFO ran far over its target and the surplus was
+    /// dropped (with a crossfade). Underruns of those strips are counted in `input_underruns`.
+    pub input_overruns: AtomicU32,
     /// Blocks dropped because a bus-output ring was full (device not draining).
     pub output_overruns: AtomicU32,
     /// Blocks dropped because a recorder ring was full (writer thread too slow).

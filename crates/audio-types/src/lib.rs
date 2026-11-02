@@ -558,6 +558,20 @@ pub struct BusId(pub u8);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PortSlot(pub u8);
 
+/// Which clock a strip's input ring runs on (PLAN.md §5.1).
+/// ? Chosen by the control plane, which knows where the audio comes from: the device that
+/// ? clocks the mixer is `Master`; every other device and every LAN stream is `External`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum ClockDomain {
+    /// Same clock as the mixer: the ring is read directly (no resampler).
+    #[default]
+    Master,
+    /// Another clock: read through the drift resampler, steering the ring's fill level
+    /// to `target_ms`.
+    /// ? For a LAN stream use `NetworkBufferPreset::effective_target_ms(packet_ms)`.
+    External { target_ms: f32 },
+}
+
 /// !! Must stay `Copy` and small: popping/dropping on the RT thread may never free().
 /// ? Device names, sockets, configs never travel here — the control plane opens
 /// ? devices on its own thread, wires them to a PortSlot, then sends `Attach*`.
@@ -611,6 +625,12 @@ pub enum EngineCommand {
     },
     DetachStripInput {
         strip: StripId,
+    },
+    /// Switch a strip between the master clock and an external one. Resets the strip's
+    /// resampler and drift controller; takes effect on the next block.
+    SetStripClock {
+        strip: StripId,
+        clock: ClockDomain,
     },
     AttachBusOutput {
         bus: BusId,
@@ -710,6 +730,25 @@ mod tests {
         let sz = core::mem::size_of::<EngineCommand>();
         println!("EngineCommand = {sz} bytes");
         assert!(sz <= 128);
+    }
+
+    #[test]
+    fn clock_domain_roundtrips_and_defaults_to_master() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Cfg {
+            clock: ClockDomain,
+        }
+        assert_eq!(ClockDomain::default(), ClockDomain::Master);
+        for clock in [
+            ClockDomain::Master,
+            ClockDomain::External { target_ms: 12.5 },
+        ] {
+            let c = Cfg { clock };
+            let t = toml::to_string(&c).unwrap();
+            assert_eq!(toml::from_str::<Cfg>(&t).unwrap(), c, "{t}");
+            let j = serde_json::to_string(&c).unwrap();
+            assert_eq!(serde_json::from_str::<Cfg>(&j).unwrap(), c, "{j}");
+        }
     }
 
     #[test]

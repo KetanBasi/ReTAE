@@ -9,15 +9,19 @@ mod common;
 
 use audio_engine::{EngineHandles, create_engine};
 use audio_types::{
-    BusId, Compressor, ENGINE_BLOCK_FRAMES, EngineCommand as C, EqBand, Gate, RouteSend, StripDsp,
-    StripId,
+    BusId, ClockDomain, Compressor, ENGINE_BLOCK_FRAMES, EngineCommand as C, EqBand, Gate,
+    RouteSend, StripDsp, StripId,
 };
 use common::{BLOCK, sine};
 use std::time::Instant;
 
 /// Worst-case configuration: 256 enabled sends (half pre-fader), gate + 3-band EQ +
 /// compressor on every strip, 3-band EQ on every bus, and every bus also recorded.
-fn build_full_rig() -> (
+///
+/// With `external` every strip is additionally on an external clock (drift adapter in the path).
+fn build_full_rig(
+    external: bool,
+) -> (
     audio_engine::MixerEngine,
     Vec<audio_engine::InputPort>,
     Vec<audio_engine::OutputPort>,
@@ -109,6 +113,15 @@ fn build_full_rig() -> (
                 pan: (i as f32 - 7.5) / 8.0,
             })
             .unwrap();
+        if external {
+            // Every strip is a non-master endpoint: FIFO -> drift resampler -> mixer.
+            commands
+                .push(C::SetStripClock {
+                    strip: StripId(i),
+                    clock: ClockDomain::External { target_ms: 12.0 },
+                })
+                .unwrap();
+        }
         ins.push(p);
     }
     for j in 0..16u8 {
@@ -157,6 +170,13 @@ fn build_full_rig() -> (
         }
     }
     engine.process_block(BLOCK);
+    if external {
+        // The adapter regulates the ring fill seen before each pull (12 ms = 576 frames). The
+        // bench pushes 128 frames before every block, so start 128 frames below the target.
+        for p in ins.iter_mut() {
+            p.push(&vec![0.0; (576 - BLOCK) * 2]);
+        }
+    }
     (engine, ins, outs, recs)
 }
 
@@ -254,7 +274,7 @@ fn best_of(
 
 #[test]
 fn full_16x16_stays_under_the_block_budget() {
-    let (mut engine, mut ins, mut outs, mut recs) = build_full_rig();
+    let (mut engine, mut ins, mut outs, mut recs) = build_full_rig(false);
     let loud = |i: usize| sine(2, 0.25, 220.0 * (1.0 + i as f32 * 0.37), 0, BLOCK);
     let budget_us = BLOCK as f64 / 48_000.0 * 1.0e6;
 
@@ -285,9 +305,29 @@ fn full_16x16_stays_under_the_block_budget() {
         "silence",
         |_| vec![0.0; BLOCK * 2],
     );
-    // ? Both results are only *asserted* in release builds; in debug they are just printed.
+    // S2: the same worst case with a drift adapter (FIFO -> cubic resampler -> controller) in
+    // front of EVERY strip, i.e. 16 non-master endpoints. Same test function, run after the
+    // phases above, so that nothing else competes for the CPU while timing.
+    let (mut engine, mut ins, mut outs, mut recs) = build_full_rig(true);
+    run_phase(
+        &mut engine,
+        &mut ins,
+        &mut outs,
+        &mut recs,
+        WARMUP_BLOCKS,
+        loud,
+    );
+    let drift = best_of(&mut engine, &mut ins, &mut outs, &mut recs, "drift", loud);
+    println!(
+        "              = adapters add {:+.1} µs ({:.2} µs per strip) -> {:.2} % of one core",
+        drift.median - s.median,
+        (drift.median - s.median) / 16.0,
+        drift.median / budget_us * 100.0
+    );
+
+    // ? All results are only *asserted* in release builds; in debug they are just printed.
     #[cfg(debug_assertions)]
-    let _ = (&s, &quiet);
+    let _ = (&s, &quiet, &drift);
 
     #[cfg(not(debug_assertions))]
     {
@@ -300,6 +340,11 @@ fn full_16x16_stays_under_the_block_budget() {
             quiet.median < 50.0,
             "silence median {:.1} µs exceeds the 50 µs budget",
             quiet.median
+        );
+        assert!(
+            drift.median < 50.0,
+            "16x16 with a drift adapter on every strip: median {:.1} µs exceeds the 50 µs budget",
+            drift.median
         );
         assert!(
             quiet.median < s.median * 2.0 + 5.0,

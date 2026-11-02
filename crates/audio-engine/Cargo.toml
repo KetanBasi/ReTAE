@@ -13,3 +13,7 @@ rtrb.workspace = true
 # ? `assert_no_alloc` when `debug_assertions` is on. In release builds the wrapper
 # ? is compiled out by the crate itself.
 assert_no_alloc.workspace = true
+
+[dev-dependencies]
+# ? Benchmark / comparison only (tests/drift_bench.rs). Not part of the shipped engine.
+rubato.workspace = true

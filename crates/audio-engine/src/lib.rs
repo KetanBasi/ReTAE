@@ -26,6 +26,7 @@
 
 mod block;
 mod bus;
+pub mod drift;
 pub mod dsp;
 mod engine;
 mod meter;
@@ -35,6 +36,7 @@ pub mod ports;
 mod stats;
 mod strip;
 
+pub use drift::{ClockDomainAdapter, DriftController, DriftResampler, HermiteResampler};
 pub use engine::{
     DEFAULT_COMMAND_CAPACITY, EngineHandles, MAX_COMMANDS_PER_BLOCK, MixerEngine, create_engine,
 };

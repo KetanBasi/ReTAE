@@ -138,6 +138,15 @@ impl Rig {
         assert_eq!(port.push(interleaved), interleaved.len(), "input ring full");
     }
 
+    /// Frames currently queued in the strip's input ring (what the engine hasn't read yet).
+    pub fn input_fill_frames(&self, strip: u8) -> usize {
+        let port = self.inputs[strip as usize]
+            .as_ref()
+            .expect("strip has no input");
+        let queued = port.producer.buffer().capacity() - port.producer.slots();
+        queued / self.in_ch[strip as usize]
+    }
+
     /// Everything currently in the bus's output ring, interleaved.
     pub fn drain(&mut self, bus: u8) -> Vec<f32> {
         let Some(port) = self.outputs[bus as usize].as_mut() else {

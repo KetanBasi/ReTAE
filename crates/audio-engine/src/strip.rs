@@ -4,6 +4,7 @@
 //!   "post-fader" sends tap it after the fader. Pan applies to both.
 
 use crate::block::{BlockConsts, BusInfo};
+use crate::drift::ClockDomainAdapter;
 use crate::dsp::Planar;
 use crate::dsp::biquad::EqChain;
 use crate::dsp::dynamics::{CompState, GateState};
@@ -12,9 +13,19 @@ use crate::meter::MeterState;
 use crate::mixmap::{SendGains, mix_into_bus, pan_gains};
 use crate::ports::{InterleaveBuf, read_interleaved};
 use crate::stats::EngineStats;
-use audio_types::{MAX_BUSES, MeterAtomics, StripDsp};
+use audio_types::{ClockDomain, LanRxAtomics, MAX_BUSES, MeterAtomics, StripDsp, store_f32};
 use core::sync::atomic::Ordering;
 use rtrb::Consumer;
+
+/// The two telemetry blocks a strip writes to.
+// ? `lan` is indexed by the strip's own number: a strip has exactly one source, and
+// ? `MAX_LAN_STREAMS == MAX_STRIPS`, so "strip i <-> lan_rx[i]" needs no extra mapping. The
+// ? network side (S3) writes packets_lost / packets_late / last_packet_ms_ago to the same slot.
+#[derive(Clone, Copy)]
+pub(crate) struct StripTelemetry<'a> {
+    pub meter: &'a MeterAtomics,
+    pub lan: &'a LanRxAtomics,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SendState {
@@ -45,6 +56,12 @@ pub(crate) struct Strip {
     meter: MeterState,
     /// Set by `attach`: the next block starts with all ramps at their targets (no fade-in).
     fresh: bool,
+    /// Which clock the input ring runs on.
+    clock: ClockDomain,
+    /// Drift adapter, used only while `clock` is `External`.
+    // ? Boxed and created here (control thread, at engine construction) so that switching a
+    // ? strip to an external clock later is just `configure`, with no allocation on the RT thread.
+    adapter: Box<ClockDomainAdapter>,
 }
 
 impl Strip {
@@ -70,9 +87,29 @@ impl Strip {
             }; MAX_BUSES],
             meter: MeterState::new(),
             fresh: false,
+            clock: ClockDomain::Master,
+            adapter: Box::default(),
         };
         s.update_pan_targets();
         s
+    }
+
+    /// Switch between the master clock and an external one. Resets the adapter (and with it
+    /// the learned clock offset): a new clock means a new source.
+    pub fn set_clock(&mut self, clock: ClockDomain) {
+        self.clock = clock;
+        if let ClockDomain::External { target_ms } = clock {
+            self.adapter.configure(self.channels, target_ms);
+        }
+    }
+
+    /// Mirror the adapter into the strip's LAN telemetry slot (4 relaxed stores).
+    fn publish_clock(&self, lan: &LanRxAtomics) {
+        store_f32(&lan.buffer_ms, self.adapter.fill_ms());
+        store_f32(&lan.target_ms, self.adapter.target_ms());
+        store_f32(&lan.drift_ppm, self.adapter.drift_ppm());
+        lan.underruns
+            .store(self.adapter.underruns(), Ordering::Relaxed);
     }
 
     pub fn update_pan_targets(&mut self) {
@@ -90,6 +127,10 @@ impl Strip {
         self.comp = CompState::new();
         self.update_pan_targets();
         self.fresh = true;
+        // ... and, on an external clock, a fresh resampler / controller for the new channel count.
+        if let ClockDomain::External { target_ms } = self.clock {
+            self.adapter.configure(channels, target_ms);
+        }
     }
 
     pub fn detach(&mut self) {
@@ -131,11 +172,11 @@ impl Strip {
         buf: &mut Planar,
         interleave: &mut InterleaveBuf,
         k: &BlockConsts,
-        meter_out: &MeterAtomics,
+        tel: StripTelemetry<'_>,
         stats: &EngineStats,
     ) -> bool {
         let Some(cons) = input else {
-            self.meter.measure_silence(meter_out, &k.meter);
+            self.meter.measure_silence(tel.meter, &k.meter);
             return false;
         };
         if self.fresh {
@@ -144,9 +185,24 @@ impl Strip {
         }
         let frames = k.frames;
         let n = self.channels;
-        let got = read_interleaved(cons, n, frames, buf, interleave);
-        if got < frames {
-            stats.input_underruns.fetch_add(1, Ordering::Relaxed);
+        match self.clock {
+            ClockDomain::Master => {
+                let got = read_interleaved(cons, n, frames, buf, interleave);
+                if got < frames {
+                    stats.input_underruns.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            ClockDomain::External { .. } => {
+                // FIFO -> drift resampler -> block. Writes all `frames` frames (audio or silence).
+                let report = self.adapter.pull(cons, buf, frames);
+                if report.underrun {
+                    stats.input_underruns.fetch_add(1, Ordering::Relaxed);
+                }
+                if report.overrun {
+                    stats.input_overruns.fetch_add(1, Ordering::Relaxed);
+                }
+                self.publish_clock(tel.lan);
+            }
         }
         if self.dsp.gate.enabled {
             self.gate.process(&self.dsp.gate, buf, n, frames);

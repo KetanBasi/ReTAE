@@ -7,8 +7,8 @@ mod common;
 use assert_no_alloc::assert_no_alloc;
 use audio_engine::{EngineHandles, create_engine, input_slot, output_slot};
 use audio_types::{
-    BusId, Compressor, ENGINE_BLOCK_FRAMES, EngineCommand as C, EqBand, Gate, PortSlot, RouteSend,
-    StripDsp, StripId,
+    BusId, ClockDomain, Compressor, ENGINE_BLOCK_FRAMES, EngineCommand as C, EqBand, Gate,
+    PortSlot, RouteSend, StripDsp, StripId,
 };
 use common::{BLOCK, sine};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -89,7 +89,19 @@ impl Rng {
 }
 
 fn random_command(r: &mut Rng) -> C {
-    match r.below(16) {
+    match r.below(18) {
+        // Clock-domain churn: strips flip between the master clock and drift-corrected
+        // external clocks (with hostile targets) while audio is flowing through the adapters.
+        16 | 17 => C::SetStripClock {
+            strip: r.strip(),
+            clock: if r.below(3) == 0 {
+                ClockDomain::Master
+            } else {
+                ClockDomain::External {
+                    target_ms: r.float(0.0, 600.0),
+                }
+            },
+        },
         0 => C::SetStripGain {
             strip: r.strip(),
             gain_db: r.float(-90.0, 24.0),
@@ -202,6 +214,10 @@ fn reset_commands(n_strips: u8, n_buses: u8) -> Vec<C> {
         v.push(C::SetStripSolo {
             strip: s,
             solo: false,
+        });
+        v.push(C::SetStripClock {
+            strip: s,
+            clock: ClockDomain::Master,
         });
         v.push(C::SetStripDsp {
             strip: s,

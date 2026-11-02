@@ -320,7 +320,7 @@ pub(crate) type InterleaveBuf = [f32; INTERLEAVE_SAMPLES];
 // ? bookkeeping inside it. Much faster than walking the ring's two halves sample by sample.
 
 #[inline(always)]
-fn clean(s: f32) -> f32 {
+pub(crate) fn clean(s: f32) -> f32 {
     // Common case first: one compare. NaN fails `<=`, so it lands in the slow branches.
     if s.abs() <= INPUT_LIMIT {
         s
@@ -331,7 +331,13 @@ fn clean(s: f32) -> f32 {
     }
 }
 
-fn deinterleave(src: &[f32], channels: usize, out: &mut Planar) {
+// ? Generic over the row length `N` so the drift adapter's wider staging buffer
+// ? (`Work`, 192 frames per channel) can share this code with the 128-frame engine blocks.
+pub(crate) fn deinterleave<const N: usize>(
+    src: &[f32],
+    channels: usize,
+    out: &mut [[f32; N]; MAX_CHANNELS],
+) {
     match channels {
         1 => {
             for (o, &s) in out[0].iter_mut().zip(src) {

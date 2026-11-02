@@ -17,10 +17,11 @@ use crate::ports::{
     ControlPorts, EnginePorts, create_port_pool, discard_all, input_index, output_index,
 };
 use crate::stats::EngineStats;
-use crate::strip::Strip;
+use crate::strip::{Strip, StripTelemetry};
 use assert_no_alloc::assert_no_alloc;
 use audio_types::{
-    ENGINE_BLOCK_FRAMES, EngineCommand, MAX_BUSES, MAX_CHANNELS, MAX_STRIPS, Telemetry,
+    ClockDomain, ENGINE_BLOCK_FRAMES, EngineCommand, MAX_BUSES, MAX_CHANNELS, MAX_STRIPS,
+    Telemetry, store_f32,
 };
 use core::sync::atomic::Ordering;
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -177,12 +178,16 @@ impl MixerEngine {
                 .enumerate()
             {
                 let input = strip.input_slot.map(|s| &mut ports.inputs[s]);
+                let strip_tel = StripTelemetry {
+                    meter: &tel.strips[base + m],
+                    lan: &tel.lan_rx[base + m],
+                };
                 on[m] = strip.read_and_gate(
                     input,
                     buf,
                     &mut scratch.interleave,
                     consts,
-                    &tel.strips[base + m],
+                    strip_tel,
                     stats,
                 );
             }
@@ -437,6 +442,25 @@ impl MixerEngine {
                     bail!()
                 };
                 s.detach();
+            }
+            C::SetStripClock { strip, clock } => {
+                let si = strip.0 as usize;
+                // A non-finite target is garbage: reject the whole command, apply nothing.
+                if let ClockDomain::External { target_ms } = clock {
+                    if !target_ms.is_finite() {
+                        bail!()
+                    }
+                }
+                let Some(s) = self.strips.get_mut(si) else {
+                    bail!()
+                };
+                s.set_clock(clock);
+                // Stale numbers from the previous clock must not linger in the UI.
+                let lan = &self.telemetry.lan_rx[si];
+                store_f32(&lan.buffer_ms, 0.0);
+                store_f32(&lan.target_ms, 0.0);
+                store_f32(&lan.drift_ppm, 0.0);
+                lan.underruns.store(0, Ordering::Relaxed);
             }
             C::AttachBusOutput {
                 bus,
