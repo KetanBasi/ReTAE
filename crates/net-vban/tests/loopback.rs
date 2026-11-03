@@ -40,6 +40,12 @@ const BLOCK: usize = ENGINE_BLOCK_FRAMES;
 const FS: f32 = 48_000.0;
 const CH: usize = 2;
 const LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
+/// What the mixer-less link tests leave in the ring while they "play": 40 ms. Larger than the
+/// worst sender wake-up delay seen in the dev container (30 ms), so a late packet is never
+/// mistaken for a lost one (predictive concealment only steps in when the ring is low).
+/// ? These tests check the link (bit-exact audio, loss accounting, duplication), not latency,
+/// ? so they use the Slow preset (48 ms target, ring cap 192 ms) to have room for that cushion.
+const CUSHION_SAMPLES: usize = 1920 * CH;
 
 // ? Wall-clock tests must not overlap (see the module docs). A test that failed while holding
 // ? the lock poisons it; the next test still wants the lock, not the panic.
@@ -117,6 +123,22 @@ fn pop_all(c: &mut Consumer<f32>, into: &mut Vec<f32>) -> usize {
     into.extend_from_slice(b);
     chunk.commit_all();
     n
+}
+
+/// Like [`pop_all`] but leaves `keep` samples in the ring, the way a playing mixer leaves its
+/// jitter cushion there. Without it the ring of these mixer-less tests sits at ~0 fill all the
+/// time, which is exactly the state in which predictive concealment (NOTES N1) rightly steps
+/// in whenever a packet is a few ms late, and these tests want bit-exact audio.
+fn pop_keep(c: &mut Consumer<f32>, into: &mut Vec<f32>, keep: usize) {
+    let n = c.slots().saturating_sub(keep);
+    if n == 0 {
+        return;
+    }
+    let chunk = c.read_chunk(n).unwrap();
+    let (a, b) = chunk.as_slices();
+    into.extend_from_slice(a);
+    into.extend_from_slice(b);
+    chunk.commit_all();
 }
 
 fn push_all(p: &mut Producer<f32>, samples: &[f32]) {
@@ -211,7 +233,7 @@ fn run_link(
     drop_if: impl Fn(u32) -> bool + Send + 'static,
 ) -> Run {
     let (prod_rx, mut cons_rx) = RingBuffer::<f32>::new(1 << 17);
-    let (rx, counters) = rx_with_stream("Link", NetworkBufferPreset::Fast, prod_rx);
+    let (rx, counters) = rx_with_stream("Link", NetworkBufferPreset::Slow, prod_rx);
     let proxy = Proxy::start(rx.local_addr(), drop_if);
     let (mut prod_tx, cons_tx) = RingBuffer::<f32>::new(1 << 15);
     let tx = match TxStream::spawn(tx_config(proxy.addr, "Link", duplicate), cons_tx, CH) {
@@ -227,13 +249,13 @@ fn run_link(
             .map(|k| sample(p * BLOCK + k / CH, k % CH))
             .collect();
         push_all(&mut prod_tx, &block);
-        pop_all(&mut cons_rx, &mut out);
+        pop_keep(&mut cons_rx, &mut out, CUSHION_SAMPLES);
     }
     // Let the tail arrive: stop when nothing new has come out for 150 ms.
     let (mut quiet_since, mut last_len) = (Instant::now(), out.len());
     while quiet_since.elapsed() < Duration::from_millis(150) {
         thread::sleep(Duration::from_millis(5));
-        pop_all(&mut cons_rx, &mut out);
+        pop_keep(&mut cons_rx, &mut out, CUSHION_SAMPLES);
         if out.len() != last_len {
             (quiet_since, last_len) = (Instant::now(), out.len());
         }
@@ -242,6 +264,8 @@ fn run_link(
     assert_eq!(tx.stats().send_errors.load(Relaxed), 0, "TX socket errors");
     drop(tx);
     drop(rx);
+    // The receiver is stopped, so the cushion can be taken without prediction stepping in.
+    pop_all(&mut cons_rx, &mut out);
     Run {
         sent_frames: packets * BLOCK,
         out,
@@ -414,7 +438,7 @@ fn opus_over_real_sockets_reproduces_the_tone() {
         |i: usize| 0.5 * (core::f64::consts::TAU * 750.0 * i as f64 / f64::from(FS)).sin() as f32;
 
     let (prod_rx, mut cons_rx) = RingBuffer::<f32>::new(1 << 17);
-    let (rx, counters) = rx_with_stream("Opus", NetworkBufferPreset::Fast, prod_rx);
+    let (rx, counters) = rx_with_stream("Opus", NetworkBufferPreset::Slow, prod_rx);
     let (mut prod_tx, cons_tx) = RingBuffer::<f32>::new(1 << 15);
     let mut cfg = tx_config(rx.local_addr(), "Opus", false);
     cfg.codec = WireCodec::Opus {
@@ -434,16 +458,21 @@ fn opus_over_real_sockets_reproduces_the_tone() {
         sleep_until(t0 + Duration::from_millis(5) * p as u32);
         let block: Vec<f32> = (0..N * CH).map(|k| tone(p * N + k / CH)).collect();
         push_all(&mut prod_tx, &block);
-        pop_all(&mut cons_rx, &mut out);
+        pop_keep(&mut cons_rx, &mut out, CUSHION_SAMPLES);
     }
     let (mut quiet_since, mut last_len) = (Instant::now(), out.len());
     while quiet_since.elapsed() < Duration::from_millis(150) {
         thread::sleep(Duration::from_millis(5));
-        pop_all(&mut cons_rx, &mut out);
+        pop_keep(&mut cons_rx, &mut out, CUSHION_SAMPLES);
         if out.len() != last_len {
             (quiet_since, last_len) = (Instant::now(), out.len());
         }
     }
+    // The receiver is stopped before the cushion is taken, so prediction cannot see an empty
+    // ring and conceal packets of a sender that has finished.
+    drop(tx);
+    drop(rx);
+    pop_all(&mut cons_rx, &mut out);
 
     // Codec delay shifts the tone by a few ms: find the best alignment within +-10 ms.
     let left: Vec<f32> = out.iter().step_by(CH).copied().collect();
@@ -564,6 +593,7 @@ fn lan_in_mixer_lan_out_is_clean_and_inside_the_latency_budget() {
 
     // The mixer's clock: one block every 128/48000 s. Send the tone, mix, collect.
     let block = Duration::from_secs_f64(BLOCK as f64 / f64::from(FS));
+    let far_cushion = (counters_b.target_ms() * FS / 1000.0) as usize * CH;
     let blocks = 4 * 375; // 4 s
     let click_block = 3 * 375; // a burst after the tone has been running for 3 s
     let (mut out, mut sent_at) = (Vec::<f32>::new(), None::<Instant>);
@@ -594,7 +624,11 @@ fn lan_in_mixer_lan_out_is_clean_and_inside_the_latency_budget() {
         engine.process_block(BLOCK);
 
         let before = out.len();
-        pop_all(&mut cons_far, &mut out);
+        // ? The far end plays like a device would: it leaves its own jitter cushion (B's target)
+        // ? in the ring. A ring drained to zero is the one state in which predictive concealment
+        // ? (NOTES N1) treats a packet that is a few ms late as lost. The click therefore needs
+        // ? this cushion to pass too, so the latency below counts both receive buffers.
+        pop_keep(&mut cons_far, &mut out, far_cushion);
         if click_seen_at.is_none() && sent_at.is_some() {
             let now = Instant::now();
             if out[before..].iter().any(|v| v.abs() > 0.6) {
@@ -632,7 +666,7 @@ fn lan_in_mixer_lan_out_is_clean_and_inside_the_latency_budget() {
         .sqrt();
 
     println!(
-        "lan->mixer->lan: latency {:.1} ms (Fast target {:.1} ms), worst step x{:.3} of the tone's own, \
+        "lan->mixer->lan: latency {:.1} ms (two Fast receive buffers of {:.1} ms each), worst step x{:.3} of the tone's own, \
          rms {:.4} (want {:.4}), A: lost {} late {} concealed {}, B: lost {} late {} concealed {}, \
          engine underruns {} overruns {}, frames out {}, host noise: loop late {:.1} ms, \
          TX tick gap A {:.1} ms B {:.1} ms",
@@ -672,17 +706,6 @@ fn lan_in_mixer_lan_out_is_clean_and_inside_the_latency_budget() {
         "level changed on the way: rms {rms}"
     );
     assert!(body.iter().all(|v| v.is_finite()));
-    // Loopback loses nothing; anything counted here is the code's doing.
-    for (what, n) in [
-        ("A lost", counters_a.lost.load(Relaxed)),
-        ("A late", counters_a.late.load(Relaxed)),
-        ("A concealed", counters_a.concealed_frames.load(Relaxed)),
-        ("B lost", counters_b.lost.load(Relaxed)),
-        ("B late", counters_b.late.load(Relaxed)),
-        ("B concealed", counters_b.concealed_frames.load(Relaxed)),
-    ] {
-        assert_eq!(n, 0, "{what}");
-    }
     // ? Underruns and overruns depend on the host. The 12 ms Fast buffer absorbs about 9 ms of
     // ? delay (minus one packet); a sleeping 1 ms sender thread that wakes 20-30 ms late
     // ? drains it and then dumps a backlog burst that overruns it. That happened in the dev
@@ -701,7 +724,28 @@ fn lan_in_mixer_lan_out_is_clean_and_inside_the_latency_budget() {
         h.stats.input_underruns.load(Relaxed) - underruns0,
         h.stats.input_overruns.load(Relaxed),
     );
-    if noise < Duration::from_millis(6) {
+    // Loopback loses nothing. On a quiet host anything counted here is the code's doing. On a
+    // noisy host a packet that is delayed by more than the buffer is concealed ahead of time
+    // (predictive concealment, NOTES N1) and then counts as lost + late; that is the receiver
+    // doing its job, so only a few of them are tolerated.
+    let quiet = noise < Duration::from_millis(6);
+    for (what, n) in [
+        ("A lost", counters_a.lost.load(Relaxed)),
+        ("A late", counters_a.late.load(Relaxed)),
+        ("B lost", counters_b.lost.load(Relaxed)),
+        ("B late", counters_b.late.load(Relaxed)),
+    ] {
+        if quiet {
+            assert_eq!(n, 0, "{what} on a quiet host (wake-up delay {noise:?})");
+        } else {
+            assert!(n <= 20, "{what} = {n} is more than a few stalls explain");
+        }
+    }
+    if quiet {
+        assert_eq!(counters_a.concealed_frames.load(Relaxed), 0, "A concealed");
+        assert_eq!(counters_b.concealed_frames.load(Relaxed), 0, "B concealed");
+    }
+    if quiet {
         assert_eq!(
             (underruns, overruns),
             (0, 0),

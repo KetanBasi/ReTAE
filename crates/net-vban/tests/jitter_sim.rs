@@ -40,6 +40,9 @@ struct Scenario {
     /// Explicit reordering (`reorder`) is added on top in both cases.
     fifo: bool,
     loss: f64,
+    /// `(every, n)`: after the first `every` packets, drop `n` in a row at the start of each
+    /// block of `every` packets (a deterministic loss burst).
+    burst: Option<(usize, usize)>,
     reorder: f64,
     /// Sender clock offset against the mixer's clock.
     sender_ppm: f64,
@@ -56,6 +59,9 @@ struct Outcome {
     dup: u32,
     resyncs: u32,
     concealed_frames: u32,
+    /// Packets concealed by prediction (the ring was about to run dry, nothing had revealed
+    /// the hole).
+    predicted: u32,
     dropped_frames: u32,
     peak: f32,
     non_finite: usize,
@@ -116,7 +122,10 @@ fn network(s: &Scenario) -> (Vec<(f64, Vec<u8>)>, usize) {
             arrive = arrive.max(queue_end);
         }
         queue_end = arrive;
-        if rng.next() < s.loss {
+        let in_burst = s
+            .burst
+            .is_some_and(|(every, n)| k >= every && k % every < n);
+        if rng.next() < s.loss || in_burst {
             dropped += 1;
             continue;
         }
@@ -154,8 +163,9 @@ fn simulate(s: Scenario) -> Outcome {
     let end = arrivals.last().map_or(0.0, |a| a.0);
     let mut next_block = block_s;
     let mut next_arrival = 0usize;
-    // The RX thread's socket timeout: 5 ms normally, 1 ms while a hole is being waited on.
-    let timeout = |rx: &StreamRx| if rx.is_blocked() { 1e-3 } else { 5e-3 };
+    // The RX thread's socket timeout: 5 ms normally, 1 ms while a hole is being waited on or
+    // the ring is low enough to need watching (`wants_fast_tick`).
+    let timeout = |rx: &StreamRx| if rx.wants_fast_tick() { 1e-3 } else { 5e-3 };
     let mut next_tick = timeout(&rx);
 
     let mut o = Outcome {
@@ -191,6 +201,7 @@ fn simulate(s: Scenario) -> Outcome {
             let parsed = parse_audio_packet(&arrivals[next_arrival].1).unwrap();
             let before = cons.slots() / 2;
             let (ctr, lost0) = (parsed.header.frame_counter, counters.lost.load(Relaxed));
+            rx.set_time_us((t * 1e6) as u64);
             rx.on_audio(&parsed);
             note(
                 &mut log,
@@ -207,6 +218,7 @@ fn simulate(s: Scenario) -> Outcome {
             next_tick = t + timeout(&rx);
         } else if t == next_tick {
             let before = rx.fill_frames();
+            rx.set_time_us((t * 1e6) as u64);
             rx.tick();
             note(
                 &mut log,
@@ -277,6 +289,7 @@ fn simulate(s: Scenario) -> Outcome {
     o.dup = counters.duplicate.load(Relaxed);
     o.resyncs = counters.resyncs.load(Relaxed);
     o.concealed_frames = counters.concealed_frames.load(Relaxed);
+    o.predicted = counters.predicted.load(Relaxed);
     o.dropped_frames = counters.dropped_frames.load(Relaxed);
     o.mean_fill_ms = fill_sum / fill_n.max(1) as f64;
     o
@@ -284,7 +297,7 @@ fn simulate(s: Scenario) -> Outcome {
 
 fn report(s: &Scenario, o: &Outcome) {
     println!(
-        "{:<26} seed {:>2} | sent-lost {:>3} lost {:>3} late {:>3} dup {} resync {} | concealed {:>5} fr | \
+        "{:<26} seed {:>2} | sent-lost {:>3} lost {:>3} late {:>3} dup {} resync {} | concealed {:>5} fr (predicted {}) | \
          underruns {} overruns {} | fill mean {:>5.2} min {:>5.2} ms | peak {:.3}",
         s.name,
         s.seed,
@@ -294,6 +307,7 @@ fn report(s: &Scenario, o: &Outcome) {
         o.dup,
         o.resyncs,
         o.concealed_frames,
+        o.predicted,
         o.underruns,
         o.overruns,
         o.mean_fill_ms,
@@ -310,6 +324,7 @@ fn fast(seed: u64) -> Scenario {
         jitter_ms: 12.0,
         fifo: true,
         loss: 0.01,
+        burst: None,
         reorder: 0.005,
         sender_ppm: 0.0,
         seed,
@@ -340,6 +355,8 @@ fn trace_one() {
         fifo: env("SIM_FIFO", 1.0) != 0.0,
         loss: env("SIM_LOSS", 0.01),
         reorder: env("SIM_REORDER", 0.005),
+        sender_ppm: env("SIM_PPM", 0.0),
+        packets: env("SIM_PACKETS", 5000.0) as usize,
         ..fast(env("SIM_SEED", 1.0) as u64)
     };
     let o = simulate(s);
@@ -410,6 +427,9 @@ struct Batch {
     /// Underruns after the start-up window.
     steady_underruns: usize,
     simulated_s: f64,
+    /// Packets declared lost / concealed by prediction, summed over the runs.
+    lost: u32,
+    predicted: u32,
 }
 
 impl Batch {
@@ -447,6 +467,8 @@ fn batch(seeds: std::ops::RangeInclusive<u64>, make: impl Fn(u64) -> Scenario) -
         b.clean += usize::from(o.underruns == 0);
         b.total_underruns += o.underruns;
         b.worst_run = b.worst_run.max(o.underruns);
+        b.lost += o.lost;
+        b.predicted += o.predicted;
         b.steady_underruns += o
             .underrun_times_s
             .iter()
@@ -468,12 +490,12 @@ fn batch(seeds: std::ops::RangeInclusive<u64>, make: impl Fn(u64) -> Scenario) -
 // ?
 // ?   1. Strictly zero underruns (every seed) wherever the buffer *can* absorb the jitter:
 // ?      independent delays up to 7 ms, FIFO queueing (bursty) up to 4 ms.
-// ?   2. At 12 ms (jitter == buffer) a statistical bound: >= 75 % of runs are clean, no run has
-// ?      more than 2 underruns, and almost all of them are start-up transients.
+// ?   2. At 12 ms (jitter == buffer) a statistical bound: >= 93 % of runs are clean, no run has
+// ?      more than 1 underrun, and none of them after the start-up window.
 //
-// ? Measured over seeds 1..=60 (`survey_underruns_per_run`): FIFO 12 ms 48/60 clean (13
-// ? underruns, 2 after the first 3 s); independent 12 ms 54/60 clean (6 underruns, 1 later);
-// ? independent <= 7 ms 60/60; FIFO 4 ms 60/60.
+// ? Measured over seeds 1..=60 with predictive concealment (NOTES N1): FIFO 12 ms 58/60 clean,
+// ? independent 12 ms 59/60; independent <= 7 ms 60/60; FIFO 4 ms 60/60. Before prediction:
+// ? 48/60 and 54/60 (13 and 6 underruns).
 
 /// (1) Where the buffer is deep enough, the PLAN criterion holds to the letter: 1 % loss and
 /// 0.5 % reordering on top of the jitter change nothing.
@@ -495,8 +517,8 @@ fn fast_preset_is_exactly_clean_when_the_buffer_can_absorb_the_jitter() {
 fn fast_preset_at_12ms_jitter_is_clean_in_nearly_every_run() {
     // (label, fifo, minimum fraction of clean runs, observed over seeds 1..=60)
     for (label, fifo, min_clean) in [
-        ("independent 12 ms", false, 0.85), // observed 0.90
-        ("fifo 12 ms", true, 0.75),         // observed 0.80
+        ("independent 12 ms", false, 0.93), // observed 0.983
+        ("fifo 12 ms", true, 0.93),         // observed 0.967
     ] {
         let b = batch(1..=60, |seed| Scenario {
             name: label,
@@ -505,14 +527,13 @@ fn fast_preset_at_12ms_jitter_is_clean_in_nearly_every_run() {
         });
         assert!(b.clean_ratio() >= min_clean, "{label}: {b:?}");
         assert!(
-            b.worst_run <= 2,
+            b.worst_run <= 1,
             "{label}: a run underran repeatedly: {b:?}"
         );
-        // ? Steady state (after the start-up window) is rarer than 1 underrun per ~100 s of
-        // ? audio; the observed rate is 3 per 1600 s over both models.
-        assert!(
-            (b.steady_underruns as f64) <= (b.simulated_s / 100.0).max(1.0),
-            "{label}: too many underruns after start-up: {b:?}"
+        // ? Observed: every remaining underrun is a start-up transient.
+        assert_eq!(
+            b.steady_underruns, 0,
+            "{label}: underrun after start-up: {b:?}"
         );
     }
 }
@@ -589,19 +610,37 @@ fn optimal_preset_is_exactly_clean_on_a_perfect_wire() {
         ..fast(seed)
     });
     assert_eq!(b.total_underruns, 0, "{b:?}");
+    // ? Prediction must stay out of the way when nothing is wrong: no packet may be declared
+    // ? lost or concealed ahead of time on a wire that delivers everything on schedule.
+    assert_eq!((b.lost, b.predicted), (0, 0), "{b:?}");
 }
 
-/// `Optimal` with 1 % loss and no jitter. A single lost packet is concealed (the hole is found
-/// when the next packet arrives, one packet period later, which the ~2 packets of cushion
-/// cover). TWO LOST IN A ROW are not: nothing arrives behind the hole, so the receiver does
-/// not know anything is missing while the ring drains, and the mixer underruns. At 1 % loss
-/// that is a 1e-4 event per packet = about 20 in 533 s; the batch below sees 16 underruns,
-/// all of them of that kind (checked with `trace_one`, SIM_PRESET=0 SIM_SEED=2).
-///
-/// ? Not asserted as zero because it is a property of a 6 ms buffer, not of the code path
-/// ? under test; the floor below only catches a regression (a better receiver would raise it).
+/// The same perfect wire, but the sender's clock is off by +-208 ppm (10 Hz at 48 kHz, well
+/// beyond real crystals): the drift loop has to hold `Optimal`'s small cushion steady without
+/// the fill ever dipping far enough to trigger prediction (NOTES D1).
 #[test]
-fn optimal_preset_conceals_single_losses_but_not_bursts() {
+fn optimal_preset_holds_its_cushion_under_sender_drift() {
+    for ppm in [-208.0, 208.0] {
+        let b = batch(1..=10, |seed| Scenario {
+            name: "optimal, drifting sender",
+            preset: NetworkBufferPreset::Optimal,
+            jitter_ms: 0.0,
+            loss: 0.0,
+            reorder: 0.0,
+            sender_ppm: ppm,
+            ..fast(seed)
+        });
+        assert_eq!(b.total_underruns, 0, "{ppm} ppm: {b:?}");
+        assert_eq!((b.lost, b.predicted), (0, 0), "{ppm} ppm: {b:?}");
+    }
+}
+
+/// `Optimal` with 1 % loss and no jitter. A single lost packet is revealed by the next
+/// arrival; TWO OR MORE IN A ROW are revealed by nothing, which used to end in an underrun
+/// (16 in 40 runs, NOTES N1). Prediction (`StreamRx::predict`) now conceals the overdue packet
+/// when the ring is about to run dry, so every loss pattern the 1 % model produces is bridged.
+#[test]
+fn optimal_preset_conceals_single_losses_and_bursts() {
     let b = batch(1..=40, |seed| Scenario {
         name: "optimal, clean, 1% loss",
         preset: NetworkBufferPreset::Optimal,
@@ -609,12 +648,23 @@ fn optimal_preset_conceals_single_losses_but_not_bursts() {
         reorder: 0.0,
         ..fast(seed)
     });
-    // Observed over seeds 1..=40: 30 clean runs, 16 underruns, worst run 2.
-    assert!(b.clean_ratio() >= 0.70, "{b:?}");
-    assert!(b.worst_run <= 3, "{b:?}");
-    // A loss rate this low must not cost more than ~1 underrun per double loss.
-    assert!(
-        f64::from(b.total_underruns) <= 1.5 * b.simulated_s * 375.0 * 1e-4 + 2.0,
-        "{b:?}"
-    );
+    assert_eq!(b.total_underruns, 0, "{b:?}");
+    // The prediction really was needed (the same runs underran without it).
+    assert!(b.predicted > 0, "{b:?}");
+}
+
+/// A burst of 3 lost packets in a row (8 ms, longer than the whole 6 ms cushion) every ~100
+/// packets: still bridged, by the capped run of predicted packets.
+#[test]
+fn optimal_preset_bridges_a_three_packet_burst() {
+    let b = batch(1..=10, |seed| Scenario {
+        name: "optimal, 3-packet bursts",
+        preset: NetworkBufferPreset::Optimal,
+        jitter_ms: 0.0,
+        reorder: 0.0,
+        loss: 0.0,
+        burst: Some((100, 3)),
+        ..fast(seed)
+    });
+    assert_eq!(b.total_underruns, 0, "{b:?}");
 }

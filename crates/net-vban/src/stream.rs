@@ -44,6 +44,10 @@ pub struct StreamCounters {
     pub resyncs: AtomicU32,
     /// Frames of concealment inserted for lost packets.
     pub concealed_frames: AtomicU32,
+    /// Packets concealed *before* anything showed they were missing, because the ring was
+    /// about to run dry (see `StreamRx::tick`). Each also counts in `lost`; if the packet
+    /// does turn up afterwards it counts in `late` as well.
+    pub predicted: AtomicU32,
     /// Frames refused because the play-out FIFO was at 4 x target (consumer not draining).
     pub dropped_frames: AtomicU32,
     /// Packets at a sample rate other than the engine's 48 kHz.
@@ -135,6 +139,10 @@ impl Output<'_> {
     }
 }
 
+/// Most packets in a row that `StreamRx::predict` conceals without hearing from the sender.
+/// 4 x 2.67 ms = 10.7 ms: enough to bridge a short loss burst, short of covering a dead sender.
+pub const MAX_PREDICTED_RUN: u32 = 4;
+
 pub struct StreamRx {
     fifo: PlayoutFifo,
     window: ReorderWindow,
@@ -146,6 +154,13 @@ pub struct StreamRx {
     /// Adaptive-mode override; the larger of this and the preset's effective target wins.
     target_override_ms: Option<f32>,
     packet_frames: usize,
+    /// Packets in a row concealed by prediction since the last real arrival.
+    predicted_run: u32,
+    /// The RX thread's clock in microseconds ([`set_time_us`](Self::set_time_us)) and when the
+    /// last packet arrived on it. Both stay 0 until the owner supplies a clock, which turns
+    /// prediction off (nothing can ever look overdue).
+    now_us: u64,
+    last_arrival_us: u64,
     counters: Arc<StreamCounters>,
     telemetry: Option<(Arc<Telemetry>, usize)>,
     /// (wire channels, is_opus): a change restarts the run.
@@ -173,6 +188,9 @@ impl StreamRx {
             preset,
             target_override_ms: None,
             packet_frames: ENGINE_BLOCK_FRAMES,
+            predicted_run: 0,
+            now_us: 0,
+            last_arrival_us: 0,
             counters,
             telemetry: None,
             format: None,
@@ -192,6 +210,18 @@ impl StreamRx {
         &self.counters
     }
 
+    /// Tell the stream what time it is (any monotonic microsecond clock, same one every call).
+    /// Call before [`on_audio`](Self::on_audio) and [`tick`](Self::tick). Only predictive
+    /// concealment uses it: a packet is "overdue" once more than 1.5 packet periods have
+    /// passed since the last arrival.
+    // ? Why the ring's fill alone is not enough: with a sender clock a little off, the fill
+    // ? sits just under one block for a moment after every mixer pull and the next packet is
+    // ? simply due soon. Only "no packet for 1.5 periods" separates a late/lost packet from
+    // ? that normal wobble.
+    pub fn set_time_us(&mut self, now_us: u64) {
+        self.now_us = now_us;
+    }
+
     pub fn fill_frames(&self) -> usize {
         self.fifo.fill_frames()
     }
@@ -204,6 +234,18 @@ impl StreamRx {
     // ? by only 48 frames per look, well inside the guard.
     pub fn is_blocked(&self) -> bool {
         self.window.is_blocked()
+    }
+
+    /// The thread should look at this stream every millisecond: either a hole is being waited
+    /// on, or the ring is low enough that the *next* mixer pull could leave it below one block
+    /// with the expected packet still missing (see [`tick`](Self::tick)).
+    // ? Fill only ever falls at a mixer pull, by one block. So "fill < guard" now means "one
+    // ? pull from the danger line"; a 5 ms socket timeout could then sleep through it.
+    pub fn wants_fast_tick(&self) -> bool {
+        self.window.is_blocked()
+            || (self.window.is_started()
+                && self.predicted_run < MAX_PREDICTED_RUN
+                && self.fifo.fill_frames() < self.guard_frames())
     }
 
     pub fn target_ms(&self) -> f32 {
@@ -237,6 +279,13 @@ impl StreamRx {
         }
         self.fifo.set_target_frames(ms_to_frames(t));
         store_f32_bits(&self.counters.target_ms, t);
+    }
+
+    /// More than 1.5 packet periods since the last arrival (see `set_time_us`).
+    fn overdue(&self) -> bool {
+        let period_us = self.packet_frames as u64 * 1_000_000 / u64::from(ENGINE_SAMPLE_RATE);
+        let k = (1 + self.predicted_run) as u64; // each predicted packet pushes the deadline out
+        self.now_us.saturating_sub(self.last_arrival_us) > period_us * (2 * k + 1) / 2
     }
 
     fn guard_frames(&self) -> usize {
@@ -311,6 +360,9 @@ impl StreamRx {
             frames,
         );
 
+        // A packet arrived, so the sender is alive: prediction may start over.
+        self.predicted_run = 0;
+        self.last_arrival_us = self.now_us;
         let mut out = Output {
             fifo: &mut self.fifo,
             concealer: &mut self.concealer,
@@ -369,7 +421,44 @@ impl StreamRx {
             };
             self.window.give_up_head(&mut |e| out.emit(e));
         }
+        self.predict();
         self.publish();
+    }
+
+    /// Predictive concealment. Nothing is held behind the expected packet (so the rule above
+    /// has nothing to go on), yet the ring has fallen below one engine block: the next mixer
+    /// pull would underrun. Waiting any longer can only turn into a fade-out and a long
+    /// rebuffer, so treat the expected packet as lost *now* and play the concealment instead.
+    ///
+    /// This is what lets the Optimal preset (about two packets deep) survive two lost packets
+    /// in a row: the second hole is never revealed by a later arrival.
+    // ? The trade-off: a packet that is merely very late (not lost) is concealed too, and
+    // ? then dropped as `late` when it finally arrives. That costs a short dip, against the
+    // ? alternative of an underrun that costs the dip *plus* a rebuffer. The run is capped so
+    // ? a sender that stopped for good gets a real underrun (clean fade-out) and not endless
+    // ? synthetic silence.
+    fn predict(&mut self) {
+        // ? `overdue` is re-read each pass: after one prediction the *next* packet counts from
+        // ? the same last arrival, so a long outage keeps being bridged (up to the cap).
+        while self.window.is_started()
+            && !self.window.is_blocked()
+            && self.predicted_run < MAX_PREDICTED_RUN
+            && self.fifo.fill_frames() < ENGINE_BLOCK_FRAMES
+            && self.overdue()
+        {
+            let mut out = Output {
+                fifo: &mut self.fifo,
+                concealer: &mut self.concealer,
+                conceal_buf: &mut self.conceal_buf,
+                counters: &self.counters,
+                conceal_cap_frames: 2 * ms_to_frames(self.counters.target_ms()),
+                #[cfg(feature = "opus")]
+                opus: &mut self.opus,
+            };
+            self.window.give_up_head(&mut |e| out.emit(e));
+            self.predicted_run += 1;
+            self.counters.predicted.fetch_add(1, Relaxed);
+        }
     }
 
     fn publish(&self) {
@@ -744,4 +833,116 @@ mod tests {
         let c = h.rx.counters();
         assert!(StreamCounters::get(&c.bad_payload) + StreamCounters::get(&c.unsupported) >= 1);
     }
+
+    // SECTION: predictive concealment
+    //
+    // ? Time is virtual: `set_time_us` is the only clock the stream sees. One packet is 128
+    // ? frames = 2667 us, so "overdue" means more than 4000 us since the last arrival.
+
+    /// Feed two packets (so a run exists), then play out until `left` frames remain.
+    fn primed(left_frames: usize) -> Harness {
+        let mut h = Harness::new(2, 128, NetworkBufferPreset::Optimal);
+        for (i, t) in [0u64, 2667].into_iter().enumerate() {
+            h.rx.set_time_us(t);
+            let w = h.packet(|_| 0.25 + i as f32 * 0.01);
+            h.feed(&w);
+        }
+        let play = h.rx.fill_frames() - left_frames;
+        let chunk = h.cons.read_chunk(play * h.ch).unwrap();
+        chunk.commit_all();
+        h
+    }
+
+    fn tick_at(h: &mut Harness, t: u64) {
+        h.rx.set_time_us(t);
+        h.rx.tick();
+    }
+
+    #[test]
+    fn an_overdue_packet_is_concealed_before_the_ring_runs_dry() {
+        let mut h = primed(100); // below one block (128): the next pull would underrun
+        let c = h.rx.counters().clone();
+        // 3000 us after the last arrival: the packet is merely due, not overdue.
+        tick_at(&mut h, 2667 + 3000);
+        assert_eq!(StreamCounters::get(&c.predicted), 0);
+        assert_eq!(h.rx.fill_frames(), 100);
+        // 4100 us: more than 1.5 periods. Conceal it.
+        tick_at(&mut h, 2667 + 4100);
+        assert_eq!(StreamCounters::get(&c.predicted), 1);
+        assert_eq!(StreamCounters::get(&c.lost), 1);
+        assert_eq!(h.rx.fill_frames(), 100 + 128);
+        // The real packet turns up afterwards: dropped as late, not played twice.
+        h.rx.set_time_us(2667 + 4500);
+        let w = h.packet(|_| 0.5);
+        h.feed(&w);
+        assert_eq!(StreamCounters::get(&c.late), 1);
+        assert_eq!(h.rx.fill_frames(), 100 + 128);
+    }
+
+    #[test]
+    fn a_ring_with_plenty_of_fill_is_never_predicted_into() {
+        let mut h = primed(200); // a whole block available: no danger yet
+        let c = h.rx.counters().clone();
+        tick_at(&mut h, 2667 + 20_000);
+        assert_eq!(StreamCounters::get(&c.predicted), 0);
+        assert_eq!(h.rx.fill_frames(), 200);
+    }
+
+    #[test]
+    fn without_a_clock_nothing_is_ever_overdue() {
+        let mut h = Harness::new(2, 128, NetworkBufferPreset::Optimal);
+        for _ in 0..2 {
+            let w = h.packet(|_| 0.25);
+            h.feed(&w);
+        }
+        let chunk = h.cons.read_chunk(200 * h.ch).unwrap();
+        chunk.commit_all();
+        h.rx.tick();
+        assert_eq!(StreamCounters::get(&h.rx.counters().predicted), 0);
+    }
+
+    #[test]
+    fn a_dead_sender_gets_a_bounded_run_then_a_real_underrun() {
+        let mut h = primed(0);
+        let c = h.rx.counters().clone();
+        let mut t = 2667;
+        for _ in 0..40 {
+            t += 1000;
+            tick_at(&mut h, t);
+            // Mixer keeps playing whatever there is.
+            let n = h.cons.slots();
+            if n > 0 {
+                h.cons.read_chunk(n).unwrap().commit_all();
+            }
+        }
+        assert_eq!(StreamCounters::get(&c.predicted), MAX_PREDICTED_RUN);
+        assert!(!h.rx.wants_fast_tick(), "stops polling once it gave up");
+        // The sender comes back: prediction is armed again.
+        h.rx.set_time_us(t + 5000);
+        let w = h.packet(|_| 0.5);
+        h.feed(&w);
+        assert_eq!(h.rx.predicted_run, 0);
+    }
+
+    #[test]
+    fn a_burst_of_lost_packets_is_bridged_one_packet_per_period() {
+        let mut h = primed(100);
+        let c = h.rx.counters().clone();
+        let mut t = 2667;
+        let mut seen = vec![];
+        for _ in 0..30 {
+            t += 1000;
+            tick_at(&mut h, t);
+            // Drain a block whenever one is available, like the mixer does.
+            if h.cons.slots() / h.ch >= ENGINE_BLOCK_FRAMES {
+                let c2 = h.cons.read_chunk(ENGINE_BLOCK_FRAMES * h.ch).unwrap();
+                c2.commit_all();
+            }
+            seen.push(StreamCounters::get(&c.predicted));
+        }
+        // Each missing packet is covered once its own deadline (2.5, 3.5, ... periods) passed.
+        assert_eq!(*seen.last().unwrap(), MAX_PREDICTED_RUN);
+        assert!(seen.windows(2).all(|w| w[1] >= w[0]));
+    }
+    // !SECTION: predictive concealment
 }

@@ -292,6 +292,7 @@ impl RxSocket {
             handler,
             streams: Vec::with_capacity(MAX_LAN_STREAMS),
             timeout: RECV_TIMEOUT,
+            epoch: Instant::now(),
         };
         let thread = std::thread::Builder::new()
             .name(format!("vban-rx-{}", local.port()))
@@ -396,6 +397,8 @@ struct Worker {
     streams: Vec<Entry>,
     /// The timeout currently set on the socket (changing it is a syscall).
     timeout: Duration,
+    /// Zero of the clock handed to `StreamRx::set_time_us`.
+    epoch: Instant,
 }
 
 impl Worker {
@@ -427,7 +430,7 @@ impl Worker {
     }
 
     fn adjust_timeout(&mut self) {
-        let want = if self.streams.iter().any(|e| e.rx.is_blocked()) {
+        let want = if self.streams.iter().any(|e| e.rx.wants_fast_tick()) {
             BLOCKED_TIMEOUT
         } else {
             RECV_TIMEOUT
@@ -472,7 +475,9 @@ impl Worker {
     /// Per loop: let every stream run its give-up rule and publish how stale it is.
     fn housekeeping(&mut self) {
         let now = Instant::now();
+        let now_us = now.duration_since(self.epoch).as_micros() as u64;
         for e in &mut self.streams {
+            e.rx.set_time_us(now_us);
             e.rx.tick();
             let age = e.last_rx.map_or(NEVER, |t| {
                 now.duration_since(t).as_millis().min(u128::from(NEVER - 1)) as u32
@@ -492,8 +497,10 @@ impl Worker {
                 let h = parsed.header;
                 match self.route(*src.ip(), &h.stream_name) {
                     Route::Stream(i) => {
+                        let now = Instant::now();
                         let e = &mut self.streams[i];
-                        e.last_rx = Some(Instant::now());
+                        e.last_rx = Some(now);
+                        e.rx.set_time_us(now.duration_since(self.epoch).as_micros() as u64);
                         e.rx.on_audio(&parsed);
                         self.stats.audio.fetch_add(1, Relaxed);
                     }

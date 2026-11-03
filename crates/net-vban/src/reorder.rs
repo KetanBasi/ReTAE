@@ -121,6 +121,11 @@ impl ReorderWindow {
         self.started && !self.head_present() && self.slots.iter().any(|s| s.present)
     }
 
+    /// True once the first packet of the current run has arrived (`expected` is meaningful).
+    pub fn is_started(&self) -> bool {
+        self.started
+    }
+
     /// Number of packets currently held back.
     pub fn held(&self) -> usize {
         self.slots.iter().filter(|s| s.present).count()
