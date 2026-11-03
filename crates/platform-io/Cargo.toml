@@ -1,9 +1,12 @@
 [package]
 name = "platform-io"
-description = "AudioBackend trait + mock | WASAPI | PipeWire | cpal | AAudio backends (stub until S4)"
+description = "AudioBackend trait, mock backend and timer master clock (real backends: S5 PipeWire, S6 WASAPI, S8 AAudio)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+audio-types.workspace = true
+audio-engine.workspace = true
+serde.workspace = true

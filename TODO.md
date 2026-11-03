@@ -12,7 +12,8 @@ Update in place: delete an item when done and put the result where noted (intero
 - [ ] **Wi-Fi**: real jitter and loss on 5 GHz; confirm the Fast (12 ms) and Medium (24 ms) presets; `WIFI_MODE_FULL_LOW_LATENCY` ping histogram with and without (§12.4).
 - [ ] **Discovery**: mDNS between two machines and through an access point (multicast filtering); fallback beacon against VoiceMeeter peers; Android `MulticastLock` (S8).
 - [ ] **Android (§12.1–3)**: playback-capture latency (click-loop probe), screen lock vs MediaProjection, OEM foreground-service kills; run `cargo test -p net-vban` on the device.
-- [ ] **Real pipeline latency**: the loopback test measured 24–30 ms (two Fast receive buffers, budget 70 ms) without devices; device and OS buffers need `router-cli probe` (S4/S5).
+- [ ] **Real pipeline latency**: the loopback test measured 24–30 ms (two Fast receive buffers, budget 70 ms) without devices, and `router-cli probe` measures the mixer path (C2) at ~8 ms for an 8 ms target. Device and OS buffers need real backends (S5/S6); then run `router-cli probe <peer>` between two real machines.
+- [ ] **`router-cli probe <ip>` against a real VoiceMeeter** (VBAN-SERVICE round trip, under the §12.5 interop item), and against a ReTAE on another machine over wired and Wi-Fi.
 - [ ] Re-run the 16×16 bench on the target PC and an Android ARM phone (E2).
 - [ ] Run `cargo test -p net-vban --test loopback -- --nocapture` on a real desktop: the mixer test should print no `NOTE: noisy host` and 0 underruns/overruns (N11).
 
@@ -20,8 +21,8 @@ Update in place: delete an item when done and put the result where noted (intero
 - [ ] Packet-phase-independent fill estimate for the drift controller (D1): a step/phase tracker; Optimal only.
 - [ ] Rebind sockets after errors (N5); per-interface beacon targets (N6).
 - [ ] Ring size versus 8-channel targets (E1); show rejected commands in the inspector (E4).
+- [ ] `routerd` graceful shutdown on SIGTERM/Ctrl-C (C5).
 
 ## Planned (PLAN §11)
-- **S4**: wire `RxSocket`, `TxStream`, `Service`, `Discovery` into `routerd`; fill `RxPolicy.allowed` from discovered or paired peers; `router-cli probe` uses `Service::ping` and `Peer.rtt`.
-- **S5/S6/S8**: RT priorities for the net threads (N4); backends open devices at 48 kHz (A2).
-- **S9**: adaptive target (N3), VBAN-TEXT remote control of VoiceMeeter peers (N7), Noise/`snow` pairing, FLAC/Opus recording, patchbay cards.
+- **S5/S6/S8**: real backends (C1); RT priorities for the net threads (N4); backends open devices at 48 kHz (A2); a drift resampler on non-master bus outputs (C3); `docs/interop.md`.
+- **S9**: adaptive target (N3), VBAN-TEXT remote control of VoiceMeeter peers (N7), Noise/`snow` pairing, FLAC/Opus recording (drain the recorder ring, C4), patchbay cards.

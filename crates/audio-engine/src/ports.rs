@@ -120,12 +120,33 @@ impl InputPort {
             Err(_) => 0,
         }
     }
+
+    /// Split into the slot number and the bare ring half.
+    // ? Net threads want a bare `Producer` (`StreamRx`) or `Consumer` (`TxStream`), and hand it
+    // ? back when they stop. Keeping the slot number on the side and rebuilding the port with
+    // ? `from_parts` is how a LAN stream returns its ring to the pool (rings are never freed).
+    pub fn into_parts(self) -> (PortSlot, Producer<f32>) {
+        (self.slot, self.producer)
+    }
+
+    pub fn from_parts(slot: PortSlot, producer: Producer<f32>) -> Self {
+        Self { slot, producer }
+    }
 }
 
 impl OutputPort {
     /// Slot number to put in `EngineCommand::AttachBusOutput`.
     pub fn slot(&self) -> PortSlot {
         self.slot
+    }
+
+    /// See [`InputPort::into_parts`].
+    pub fn into_parts(self) -> (PortSlot, Consumer<f32>) {
+        (self.slot, self.consumer)
+    }
+
+    pub fn from_parts(slot: PortSlot, consumer: Consumer<f32>) -> Self {
+        Self { slot, consumer }
     }
 
     /// Pop up to `out.len()` samples; returns how many were written into `out`.

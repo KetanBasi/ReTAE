@@ -1,9 +1,16 @@
 [package]
 name = "routerd"
-description = "Desktop engine daemon + tray helper (stub until S4)"
+description = "Desktop engine daemon: mixer clock, audio backend, VBAN sockets, IPC server, single-instance lock"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+audio-types.workspace = true
+audio-engine.workspace = true
+platform-io.workspace = true
+app-core.workspace = true
+# ? Debug builds install this as the global allocator in the binary, so any allocation inside
+# ? `process_block` aborts (CLAUDE.md law 1). Release builds do not link the check.
+assert_no_alloc.workspace = true
