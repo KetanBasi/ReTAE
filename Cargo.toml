@@ -35,6 +35,13 @@ assert_no_alloc = "1.1.2"
 # ? Dev-only: the S2 benchmark compares our resampler with rubato's cubic one. 4.0.x is the
 # ? newest release that builds on the workspace `rust-version`; the FFT resamplers are not needed.
 rubato = { version = "4.0.0", default-features = false }
+# * S3 (net-vban). socket2: buffer sizes, SO_REUSEADDR, IP_TOS, broadcast. mdns-sd: pure Rust.
+socket2 = { version = "0.6.5", features = ["all"] }
+mdns-sd = "0.21.7"
+# ? Opus is the only C dependency in the workspace and is optional (CLAUDE.md law 3).
+opus = "0.4.0"
+# ? Windows-only: qWAVE QoS (IP_TOS is ignored by the Windows stack). Raw FFI, no `windows` crate.
+windows-sys = "0.61.2"
 # !SECTION: Workspace
 
 # SECTION: Profiles

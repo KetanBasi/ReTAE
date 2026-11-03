@@ -1,9 +1,35 @@
 [package]
 name = "net-vban"
-description = "VBAN packet codec, RX/TX threads, reorder + jitter buffer, discovery (stub until S3)"
+description = "VBAN packet codec, RX/TX threads, reorder + jitter buffer, VBAN-SERVICE/TEXT, discovery"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+# ? Opus rides in the VBAN `User` codec slot. Without this feature the crate is PCM-only and
+# ? needs no C toolchain.
+opus = ["dep:opus"]
+
 [dependencies]
+audio-types.workspace = true
+rtrb.workspace = true
+socket2.workspace = true
+mdns-sd.workspace = true
+opus = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Media", # timeBeginPeriod (1 ms TX tick)
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_QoS",
+] }
+
+[dev-dependencies]
+# ? End-to-end tests feed the RX thread's ring into the real drift adapter / mixer.
+audio-engine.workspace = true
+# ? The loopback test installs the checking allocator so `process_block` is proven alloc-free
+# ? while the network threads run next to it.
+assert_no_alloc.workspace = true

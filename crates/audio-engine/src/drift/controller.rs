@@ -116,11 +116,23 @@ impl DriftController {
         let dt_s = frames as f32 / SAMPLE_RATE;
         let err_ms = self.ema_ms - self.target_ms;
 
-        // Anti-windup: the integrator alone never needs to exceed the output clamp.
-        self.integral_ppm = (self.integral_ppm + self.gains.ki_ppm_per_ms_s * err_ms * dt_s)
+        // Anti-windup (conditional integration): while the output is pinned at the clamp *and*
+        // the error still pushes the same way, the integrator stands still.
+        // ? Without this, a large fill error (a stream that starts 5 ms above target, or a
+        // ? burst after a network stall) saturates the P term for seconds; the integrator keeps
+        // ? adding up meanwhile, and once the fill reaches the target that stored charge keeps
+        // ? pushing it through: the fill ends up *below* target, which for a jitter buffer is
+        // ? the dangerous side. Small errors never saturate, so the normal tracking of a clock
+        // ? offset is untouched.
+        let p_term = self.gains.kp_ppm_per_ms * err_ms;
+        let next_integral = (self.integral_ppm + self.gains.ki_ppm_per_ms_s * err_ms * dt_s)
             .clamp(-MAX_PPM, MAX_PPM);
-        let desired =
-            (self.gains.kp_ppm_per_ms * err_ms + self.integral_ppm).clamp(-MAX_PPM, MAX_PPM);
+        let next_desired = p_term + next_integral;
+        let pinned = next_desired.abs() > MAX_PPM && next_desired.signum() == err_ms.signum();
+        if !pinned {
+            self.integral_ppm = next_integral;
+        }
+        let desired = (p_term + self.integral_ppm).clamp(-MAX_PPM, MAX_PPM);
 
         let max_step = SLEW_PPM_PER_BLOCK * frames as f32 / ENGINE_BLOCK_FRAMES as f32;
         self.ppm += (desired - self.ppm).clamp(-max_step, max_step);
@@ -240,6 +252,53 @@ mod tests {
             step(&mut c, &mut fill, -1500.0);
         }
         assert_eq!(c.ppm(), -MAX_PPM);
+    }
+
+    #[test]
+    fn a_fill_that_starts_high_comes_down_to_the_target_without_undershooting() {
+        // A stream that starts with a cushion (or a burst after a network stall) begins several
+        // ms above the target with no clock offset at all. The P term saturates at once; the
+        // loop must drain the extra and stop AT the target. Undershooting is the dangerous
+        // direction for a jitter buffer.
+        let target = 12.0_f32;
+        let mut dips = Vec::new();
+        for start_error in [3.0_f32, 6.0, 12.0, 30.0] {
+            for offset in [0.0_f32, 150.0, -150.0] {
+                let mut c = DriftController::new(target);
+                let mut fill = target + start_error;
+                let (mut lowest, mut settled_at) = (fill, None);
+                for b in 0..(120.0 / BLOCK_S) as usize {
+                    let ratio = c.update(fill, ENGINE_BLOCK_FRAMES);
+                    let applied = ((ratio - 1.0) * 1.0e6) as f32;
+                    fill += 1.0e-3 * (offset - applied) * BLOCK_S;
+                    lowest = lowest.min(fill);
+                    if settled_at.is_none() && (fill - target).abs() < 0.5 {
+                        settled_at = Some(b as f32 * BLOCK_S);
+                    }
+                }
+                println!(
+                    "start +{start_error:>4} ms, offset {offset:>6} ppm: lowest {lowest:.2} ms, within 0.5 ms after {settled_at:?} s"
+                );
+                // ? A PI loop around an integrating plant always dips a little below the target
+                // ? after it has come down from above (the integrator holds charge from the
+                // ? descent), and learning a -150 ppm offset needs a stretch of negative error
+                // ? anyway. What must not happen is the dip growing with the start error, which
+                // ? is what a wound-up integrator does: it scales with how long the P term sat
+                // ? at the clamp.
+                let dip = target - lowest;
+                dips.push((start_error, offset, dip));
+                assert!(
+                    settled_at.is_some_and(|t| t < 100.0),
+                    "start +{start_error} ms, offset {offset}: never settled ({settled_at:?})"
+                );
+            }
+        }
+        for &(start_error, offset, dip) in &dips {
+            assert!(
+                dip < 1.6,
+                "start +{start_error} ms, offset {offset}: fill undershot by {dip} ms"
+            );
+        }
     }
 
     #[test]

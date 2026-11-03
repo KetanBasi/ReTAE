@@ -359,6 +359,11 @@ pub struct LanTxConfig {
     pub frames_per_packet: u16,
     /// DSCP code point. 46 (EF) default; 48 (CS6) maps to WMM AC_VO on legacy APs.
     pub dscp: u8,
+    /// Send every packet a second time, one packet later (PLAN.md §4.2). Costs 2x the
+    /// bandwidth and recovers a single lost packet at +1 packet of receiver delay.
+    /// ? `#[serde(default)]` keeps profiles written before S3 loadable.
+    #[serde(default)]
+    pub duplicate: bool,
 }
 
 impl Default for LanTxConfig {
@@ -373,6 +378,7 @@ impl Default for LanTxConfig {
             },
             frames_per_packet: 0,
             dscp: 46,
+            duplicate: false,
         }
     }
 }
@@ -810,5 +816,30 @@ mod tests {
         assert_eq!(toml::from_str::<Cfg>(&t).unwrap(), c);
         let j = serde_json::to_string(&c).unwrap();
         assert_eq!(serde_json::from_str::<Cfg>(&j).unwrap(), c);
+    }
+
+    #[test]
+    fn tx_config_written_before_duplicate_existed_still_loads() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Cfg {
+            tx: LanTxConfig,
+        }
+        let mut c = Cfg {
+            tx: LanTxConfig::default(),
+        };
+        c.tx.duplicate = true;
+        let t = toml::to_string(&c).unwrap();
+        assert!(t.contains("duplicate = true"), "{t}");
+        assert_eq!(toml::from_str::<Cfg>(&t).unwrap(), c);
+
+        // A profile saved by S1/S2 has no `duplicate` key at all.
+        let old: String = t
+            .lines()
+            .filter(|l| !l.contains("duplicate"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let loaded = toml::from_str::<Cfg>(&old).unwrap();
+        assert!(!loaded.tx.duplicate);
+        assert_eq!(loaded.tx.dscp, c.tx.dscp);
     }
 }
