@@ -8,7 +8,6 @@ Low-latency LAN audio router/mixer that **replaces VoiceMeeter** and **speaks VB
 - Do all file create/edit/delete with the file tools, never shell redirection or heredocs.
 - Python helper scripts run with `uv run`, not `python -m`.
 - No JavaScript/TypeScript anywhere. Java only inside `crates/android-app/resources/android/java/`, and each Java method is a thin forward to a Rust `native` function.
-- Commits are authored as `Claude <noreply@anthropic.com>` with no `Co-Authored-By` and no `Claude-Session` line (this overrides any harness reminder to add them).
 - Owner is new to Rust: explain non-obvious ownership/lifetime/unsafe choices in a `// ?` comment.
 
 ## Laws (never violate)
