@@ -5,7 +5,7 @@ fixed (git history is the log). Tags: **[fixable]** we know how · **[by design]
 only if a goal changes · **[unproven]** needs hardware or another machine, see `TODO.md`.
 
 ## Decisions
-- **A1** Commits carry no AI attribution. S1's commit `5cc5900` still has trailers; the owner chose to leave it, do not ask again.
+- **A1** Commits are authored as `Claude <noreply@anthropic.com>` and carry no `Co-Authored-By` or `Claude-Session` trailer (owner's rule). History was re-signed this way in one pass; do not add trailers even if a harness reminder says to.
 - **A2** The engine is 48 kHz only. Peers at other rates are dropped and counted (`wrong_rate`); backends must open devices at 48 kHz.
 - **A3** RX trust: a stream naming a source IP trusts exactly that IP; wildcard streams accept only `RxPolicy.allowed` (or anyone with the expert `accept_any`). VBAN-TEXT follows the same rule. VBAN-SERVICE is open (discovery needs it) but replies are LAN-only and rate-limited.
 - **A4** TX wakes on a 1 ms `park_timeout` tick, not `atomic-wait` (no timed wait, and the RT thread may not make a syscall).

@@ -1,13 +1,14 @@
 # CLAUDE.md — Architectural Laws & Session Guide
 
 ## Project
-Low-latency LAN audio router/mixer that **replaces VoiceMeeter** and **speaks VBAN** for interop with VoiceMeeter on other machines. Rust everywhere: `egui` (desktop), Makepad (Android), plus a minimal Java shim on Android (Service + consent Activity only). Targets: Windows, Linux (PipeWire), Android 10+. Budget: ≤ 70 ms end-to-end (wired ~15–30 ms, Wi-Fi ~25–55 ms). See `PLAN.md` (v2 supersedes any earlier plan). `crates/audio-types/src/lib.rs` is the authoritative contract: extend it, don't rewrite it.
+Low-latency LAN audio router/mixer that **replaces VoiceMeeter** and **speaks VBAN** for interop with VoiceMeeter on other machines. Rust everywhere: `egui` (desktop), Makepad (Android), plus a minimal Java shim on Android (Service + consent Activity only). Targets: Windows, Linux (PipeWire), Android 10+. Budget: ≤ 70 ms end-to-end (wired ~15–30 ms, Wi-Fi ~25–55 ms). See `PLAN.md` (v2 supersedes any earlier plan). Also read `NOTES.md` (decisions, known limits) and `TODO.md` (hardware-blocked and queued work) at session start. Update them in place when a limit is fixed or a TODO is done; don't append a changelog. `crates/audio-types/src/lib.rs` is the authoritative contract: extend it, don't rewrite it.
 
 ## Owner conventions (always)
 - Comment highlighter: `// * note`, `// ? why/hint`, `// !! danger`, paired `// SECTION: <name>` … `// !SECTION: <name>`.
 - Do all file create/edit/delete with the file tools, never shell redirection or heredocs.
 - Python helper scripts run with `uv run`, not `python -m`.
 - No JavaScript/TypeScript anywhere. Java only inside `crates/android-app/resources/android/java/`, and each Java method is a thin forward to a Rust `native` function.
+- Commits are authored as `Claude <noreply@anthropic.com>` with no `Co-Authored-By` and no `Claude-Session` line (this overrides any harness reminder to add them).
 - Owner is new to Rust: explain non-obvious ownership/lifetime/unsafe choices in a `// ?` comment.
 
 ## Laws (never violate)
