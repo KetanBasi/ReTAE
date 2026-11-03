@@ -51,6 +51,20 @@ pub const NEVER: u32 = u32::MAX;
 /// Senders remembered for the "unassigned streams" list of the UI.
 const SEEN_CAPACITY: usize = 16;
 
+/// Kernel buffer asked for on every VBAN socket (PLAN.md §4.3).
+// ? Windows defaults to 64 KB. At 375 packets/s of ~0.5 KB that is only ~0.3 s of slack, and a
+// ? burst of many streams or a descheduled RX thread eats it faster. Linux may cap the request
+// ? at `net.core.rmem_max` (it then reports what it granted), so this is best effort.
+pub const SOCKET_BUFFER_BYTES: usize = 256 * 1024;
+
+/// Ask the OS for [`SOCKET_BUFFER_BYTES`] of receive buffer; returns what it granted (0 if the
+/// size cannot be read). A refusal is not an error: the default buffer still works.
+pub(crate) fn grow_recv_buffer(socket: &UdpSocket) -> usize {
+    let sock = socket2::SockRef::from(socket);
+    let _ = sock.set_recv_buffer_size(SOCKET_BUFFER_BYTES);
+    sock.recv_buffer_size().unwrap_or(0)
+}
+
 // SECTION: Keys and policy
 /// Which packets belong to a stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -260,6 +274,7 @@ impl RxSocket {
         // ? No SO_REUSEADDR on purpose: on Linux that lets a second socket share a UDP port
         // ? and unicast then goes to only one of them. A busy port should be an error.
         let socket = UdpSocket::bind(addr)?;
+        grow_recv_buffer(&socket);
         socket.set_read_timeout(Some(RECV_TIMEOUT))?;
         let local = match socket.local_addr()? {
             SocketAddr::V4(a) => a,
@@ -559,6 +574,17 @@ fn is_timeout(e: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_receive_buffer_is_grown_and_never_smaller_than_the_os_default() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let default = socket2::SockRef::from(&socket).recv_buffer_size().unwrap();
+        let granted = grow_recv_buffer(&socket);
+        // ? Linux may cap the request at rmem_max, so only "not smaller" is portable; where the
+        // ? cap allows it (Windows, macOS, a tuned Linux) the full 256 KB must arrive.
+        assert!(granted >= default, "{granted} < {default}");
+        assert!(granted >= 200_000, "granted only {granted} bytes");
+    }
     use crate::packet::PcmPacketizer;
     use crate::stream::StreamCounters;
     use audio_types::{

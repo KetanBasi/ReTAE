@@ -435,12 +435,22 @@ impl Drop for TxStream {
     }
 }
 
+/// Ask the OS for the same 256 KB of send buffer as the RX side; returns what it granted.
+/// ? Matters when the TX thread sends a backlog burst (up to 40 ms of audio at once) on a
+/// ? default-sized buffer; a refusal just leaves the default in place.
+pub(crate) fn grow_send_buffer(socket: &UdpSocket) -> usize {
+    let sock = socket2::SockRef::from(socket);
+    let _ = sock.set_send_buffer_size(crate::rx::SOCKET_BUFFER_BYTES);
+    sock.send_buffer_size().unwrap_or(0)
+}
+
 fn open_socket(
     local: SocketAddrV4,
     dest: SocketAddrV4,
     dscp: u8,
 ) -> Result<(UdpSocket, SocketAddrV4, QosGuard, QosOutcome), TxError> {
     let socket = UdpSocket::bind(local)?;
+    grow_send_buffer(&socket);
     let local = match socket.local_addr()? {
         SocketAddr::V4(a) => a,
         SocketAddr::V6(_) => return Err(TxError::Io(io::ErrorKind::Unsupported.into())),
@@ -477,6 +487,15 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_send_buffer_is_grown_and_never_smaller_than_the_os_default() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let default = socket2::SockRef::from(&socket).send_buffer_size().unwrap();
+        let granted = grow_send_buffer(&socket);
+        assert!(granted >= default, "{granted} < {default}");
+        assert!(granted >= 200_000, "granted only {granted} bytes");
+    }
     use crate::packet::{RxPayload, decode_pcm, parse_audio_packet};
     use audio_types::{FixedStr, VbanDataType};
     use rtrb::{Producer, RingBuffer};
