@@ -25,18 +25,110 @@ use std::sync::Arc;
 pub enum BackendKind {
     /// Fake devices on paced threads. Always available.
     Mock,
+    /// Linux, PipeWire. Needs the `pipewire` feature and a running server.
+    PipeWire,
+    /// Linux, ALSA through `cpal`. Needs the `alsa` feature. Hardware devices only.
+    Alsa,
+    /// The best real backend this build has and this machine can reach: PipeWire, then ALSA.
+    Auto,
+}
+
+impl BackendKind {
+    /// What `routerd` uses when no `--backend` is given: `auto` if the build has a real
+    /// backend, otherwise `mock`.
+    pub fn preferred() -> Self {
+        if cfg!(all(
+            target_os = "linux",
+            any(feature = "pipewire", feature = "alsa")
+        )) {
+            Self::Auto
+        } else {
+            Self::Mock
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mock => "mock",
+            Self::PipeWire => "pipewire",
+            Self::Alsa => "alsa",
+            Self::Auto => "auto",
+        }
+    }
 }
 
 impl FromStr for BackendKind {
     type Err = String;
 
+    // ? Every name parses in every build; whether the build can actually *use* it is checked
+    // ? when the daemon starts, so the message can say which feature to turn on.
     fn from_str(s: &str) -> Result<Self, String> {
         match s {
             "mock" => Ok(Self::Mock),
-            // ? PipeWire arrives in S5, WASAPI in S6; until then they are not selectable.
-            other => Err(format!("unknown backend {other:?} (available: mock)")),
+            "pipewire" => Ok(Self::PipeWire),
+            "alsa" => Ok(Self::Alsa),
+            "auto" => Ok(Self::Auto),
+            other => Err(format!(
+                "unknown backend {other:?} (mock, pipewire, alsa or auto)"
+            )),
         }
     }
+}
+
+/// Open the backend `kind` names. The mock's steering handle comes back with it.
+fn make_backend(
+    kind: BackendKind,
+) -> Result<(Box<dyn AudioBackend>, Option<MockControl>), DaemonError> {
+    match kind {
+        BackendKind::Mock => {
+            let (backend, control) = MockBackend::new();
+            Ok((Box::new(backend), Some(control)))
+        }
+        BackendKind::PipeWire => pipewire_backend().map(|b| (b, None)),
+        BackendKind::Alsa => alsa_backend().map(|b| (b, None)),
+        BackendKind::Auto => {
+            // ? PipeWire first: it can also make virtual devices and capture one program.
+            // ? ALSA is the fallback for a machine without a PipeWire server. Both errors are
+            // ? kept, so a person sees why neither worked.
+            match pipewire_backend() {
+                Ok(b) => Ok((b, None)),
+                Err(pw) => match alsa_backend() {
+                    Ok(b) => Ok((b, None)),
+                    Err(alsa) => Err(DaemonError::Start(format!(
+                        "no audio backend available (pipewire: {pw}; alsa: {alsa})"
+                    ))),
+                },
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "pipewire"))]
+fn pipewire_backend() -> Result<Box<dyn AudioBackend>, DaemonError> {
+    platform_io::PipeWireBackend::connect(platform_io::PipeWireOptions::default())
+        .map(|b| Box::new(b) as Box<dyn AudioBackend>)
+        .map_err(|e| DaemonError::Start(format!("cannot reach PipeWire: {e}")))
+}
+
+#[cfg(not(all(target_os = "linux", feature = "pipewire")))]
+fn pipewire_backend() -> Result<Box<dyn AudioBackend>, DaemonError> {
+    Err(DaemonError::Start(
+        "built without PipeWire (Linux only; rebuild with --features pipewire)".into(),
+    ))
+}
+
+#[cfg(all(target_os = "linux", feature = "alsa"))]
+fn alsa_backend() -> Result<Box<dyn AudioBackend>, DaemonError> {
+    platform_io::AlsaBackend::connect(platform_io::AlsaOptions::default())
+        .map(|b| Box::new(b) as Box<dyn AudioBackend>)
+        .map_err(|e| DaemonError::Start(format!("cannot open ALSA: {e}")))
+}
+
+#[cfg(not(all(target_os = "linux", feature = "alsa")))]
+fn alsa_backend() -> Result<Box<dyn AudioBackend>, DaemonError> {
+    Err(DaemonError::Start(
+        "built without ALSA (Linux only; rebuild with --features alsa)".into(),
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +197,7 @@ pub struct Daemon {
     master: TimerMaster,
     control: Arc<LocalControl>,
     mock: Option<MockControl>,
+    backend_name: &'static str,
     ipc_name: String,
 }
 
@@ -119,12 +212,8 @@ impl Daemon {
         }
 
         let (engine, handles) = create_engine();
-        let (backend, mock): (Box<dyn AudioBackend>, Option<MockControl>) = match options.backend {
-            BackendKind::Mock => {
-                let (backend, control) = MockBackend::new();
-                (Box::new(backend), Some(control))
-            }
-        };
+        let (backend, mock) = make_backend(options.backend)?;
+        let backend_name = backend.name();
         let control = Arc::new(
             LocalControl::new(
                 handles,
@@ -159,8 +248,14 @@ impl Daemon {
             master,
             control,
             mock,
+            backend_name,
             ipc_name,
         })
+    }
+
+    /// Which backend `--backend auto` ended up with (`"pipewire"`, `"alsa"`, `"mock"`).
+    pub fn backend_name(&self) -> &'static str {
+        self.backend_name
     }
 
     /// The in-process control (what a UI linked into the same process would hold).

@@ -48,6 +48,14 @@ net-vban = { path = "crates/net-vban" }
 platform-io = { path = "crates/platform-io" }
 app-core = { path = "crates/app-core" }
 routerd = { path = "crates/routerd" }
+# * S5 (Linux backends). All three bind C libraries (libpipewire, ALSA, libdbus), so they are
+# * optional features of platform-io and the default workspace build needs none of them.
+# ? v0_3_49 gives `Buffer::requested` (how many frames the graph wants this cycle; a playback
+# ? stream must not fill a bigger buffer than that) and `target.object`. It sets the minimum
+# ? PipeWire at run time to 0.3.49, so Ubuntu 22.04 (0.3.48) is not supported; 24.04 is.
+pipewire = { version = "0.10.1", features = ["v0_3_49"] }
+cpal = { version = "0.18.2", default-features = false }
+audio_thread_priority = "0.38.0"
 # ? Windows-only: qWAVE QoS (IP_TOS is ignored by the Windows stack). Raw FFI, no `windows` crate.
 windows-sys = "0.61.2"
 # !SECTION: Workspace

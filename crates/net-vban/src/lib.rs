@@ -13,6 +13,7 @@
 #![deny(unsafe_code)]
 
 pub mod discovery;
+pub mod hook;
 pub mod jitter;
 #[cfg(feature = "opus")]
 pub mod opus_codec;

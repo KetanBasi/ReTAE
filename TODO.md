@@ -17,12 +17,20 @@ Update in place: delete an item when done and put the result where noted (intero
 - [ ] Re-run the 16×16 bench on the target PC and an Android ARM phone (E2).
 - [ ] Run `cargo test -p net-vban --test loopback -- --nocapture` on a real desktop: the mixer test should print no `NOTE: noisy host` and 0 underruns/overruns (N11).
 
+- [ ] **Linux on real hardware (S5)**, with PipeWire and an actual card:
+  - the VoiceMeeter ⇄ Linux table in `docs/interop.md` (also §12.5), measured with `router-cli probe <peer>`;
+  - real device latency end to end, to decide whether a device-clocked master (P2) is worth building; `output_target_ms` of 8 ms may be tunable lower;
+  - rtkit promotion actually succeeds for the mixer and net threads (P7); `routerd` prints the outcome;
+  - the ALSA fallback with a real card (P6), including the 16-bit path, and `--backend auto` falling back to it with PipeWire stopped;
+  - unplugging a USB device while its stream is open (P10).
+
 ## Software, not blocked
+- [ ] Show a failed or stalled device stream in the control plane after hot-unplug instead of `Running` (P10).
 - [ ] Packet-phase-independent fill estimate for the drift controller (D1): a step/phase tracker; Optimal only.
 - [ ] Rebind sockets after errors (N5); per-interface beacon targets (N6).
 - [ ] Ring size versus 8-channel targets (E1); show rejected commands in the inspector (E4).
 - [ ] `routerd` graceful shutdown on SIGTERM/Ctrl-C (C5).
 
 ## Planned (PLAN §11)
-- **S5/S6/S8**: real backends (C1); RT priorities for the net threads (N4); backends open devices at 48 kHz (A2); a drift resampler on non-master bus outputs (C3); `docs/interop.md`.
+- **S6/S8**: real backends for Windows and Android (C1); RT priority for the net threads there (N4: MMCSS, `THREAD_PRIORITY_URGENT_AUDIO`); open devices at 48 kHz (A2); a drift resampler on their bus outputs (C3, reuse `ring_io::PlaybackState`).
 - **S9**: adaptive target (N3), VBAN-TEXT remote control of VoiceMeeter peers (N7), Noise/`snow` pairing, FLAC/Opus recording (drain the recorder ring, C4), patchbay cards.

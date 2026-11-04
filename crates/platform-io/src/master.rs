@@ -4,11 +4,12 @@
 //! headless tests and on a box with no sound card, this thread calls `process_block`.
 
 use crate::clock::RateClock;
+use crate::rt::{RtOutcome, promote_current_thread};
 use audio_engine::MixerEngine;
 use audio_types::{ENGINE_BLOCK_FRAMES, ENGINE_SAMPLE_RATE};
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,12 @@ pub struct MasterStats {
     /// container (a microVM) sometimes shows 3 to 30 ms. Tests read this to tell a noisy host
     /// from a real fault.
     pub max_gap_us: AtomicU32,
+    /// Whether the mixer thread got real-time priority, and if not, why. Set once, right after
+    /// the thread starts; empty for the first instants of its life.
+    // ? `OnceLock` is a cell that can be filled exactly once from one thread and read from any
+    // ? other, without a lock the reader has to wait on. That suits "the thread reports how its
+    // ? start-up went".
+    pub rt: OnceLock<RtOutcome>,
 }
 
 /// Runs the engine until `stop`. Dropping it stops the thread and drops the engine.
@@ -76,6 +83,12 @@ impl Drop for TimerMaster {
 }
 
 fn run(mut engine: MixerEngine, ppm: f64, stop: &AtomicBool, stats: &MasterStats) -> MixerEngine {
+    // ? Ask for real-time scheduling on *this* thread, which is the one that mixes. A refusal
+    // ? (no rtkit, a container) is recorded and the loop runs at normal priority.
+    let _ = stats.rt.set(promote_current_thread(
+        ENGINE_BLOCK_FRAMES as u32,
+        ENGINE_SAMPLE_RATE,
+    ));
     let mut clock = RateClock::new(f64::from(ENGINE_SAMPLE_RATE));
     clock.set_ppm(ppm);
     let mut pending = 0usize;
@@ -116,5 +129,20 @@ mod tests {
         // 400 ms = 150 blocks; allow a lot for a loaded machine, but it must be running.
         assert!((60..=190).contains(&blocks), "{blocks} blocks in 400 ms");
         drop(handles);
+    }
+
+    #[test]
+    fn the_thread_reports_how_the_priority_request_went() {
+        let (engine, _handles) = create_engine();
+        let master = TimerMaster::spawn(engine, 0.0).unwrap();
+        let stats = master.stats().clone();
+        let end = Instant::now() + Duration::from_secs(2);
+        while stats.rt.get().is_none() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        match stats.rt.get().expect("the thread must report an outcome") {
+            RtOutcome::Promoted => {}
+            RtOutcome::Unavailable(why) => assert!(!why.is_empty()),
+        }
     }
 }

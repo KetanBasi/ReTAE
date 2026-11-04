@@ -6,8 +6,20 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+# * Real audio backends bind C libraries, so they are features and off by default
+# * (`cargo test --workspace` then needs no system packages). On Linux:
+# *   cargo build -p routerd --features linux-audio
+#   pipewire: libpipewire-0.3-dev + libclang;  alsa: libasound2-dev;  rt: libdbus-1-dev
+[features]
+default = []
+pipewire = ["platform-io/pipewire"]
+alsa = ["platform-io/alsa"]
+rt = ["platform-io/rt"]
+linux-audio = ["pipewire", "alsa", "rt"]
+
 [dependencies]
 audio-types.workspace = true
+net-vban.workspace = true
 audio-engine.workspace = true
 platform-io.workspace = true
 app-core.workspace = true

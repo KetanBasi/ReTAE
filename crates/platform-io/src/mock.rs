@@ -445,7 +445,7 @@ fn input_loop(
             let n = due.min(CHUNK_FRAMES);
             let chunk = &mut buf[..n * channels];
             generator.fill(signal, channels, chunk);
-            let accepted = port.push(chunk);
+            let accepted = port.push_frames(chunk, channels);
             if accepted < chunk.len() {
                 counters.xruns.fetch_add(1, Relaxed);
             }

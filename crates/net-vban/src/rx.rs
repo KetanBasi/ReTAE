@@ -403,6 +403,7 @@ struct Worker {
 
 impl Worker {
     fn run(mut self) {
+        crate::hook::thread_started(crate::hook::ThreadRole::Rx);
         // ? Stack buffer, large enough for any UDP payload we could accept (1464 B max).
         let mut buf = [0u8; 2048];
         while !self.stop.load(Relaxed) {

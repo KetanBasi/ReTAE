@@ -121,6 +121,18 @@ impl InputPort {
         }
     }
 
+    /// Like [`push`](Self::push) but only ever stores *whole frames* of `channels` samples;
+    /// returns how many samples were accepted (a multiple of `channels`).
+    // ? A ring holds interleaved samples. `push` happily stores half a frame when the ring is
+    // ? nearly full, and from then on every frame is read one channel late (left and right swap,
+    // ? or an 8-channel stream rotates) until the stream is reopened. Device threads that can hit
+    // ? a full ring must use this one.
+    pub fn push_frames(&mut self, samples: &[f32], channels: usize) -> usize {
+        let channels = channels.max(1);
+        let fit = samples.len().min(self.producer.slots());
+        self.push(&samples[..fit - fit % channels])
+    }
+
     /// Split into the slot number and the bare ring half.
     // ? Net threads want a bare `Producer` (`StreamRx`) or `Consumer` (`TxStream`), and hand it
     // ? back when they stop. Keeping the slot number on the side and rebuilding the port with
@@ -482,6 +494,27 @@ mod tests {
         assert_eq!(output_index(recorder_slot(BusId(0))), None);
         assert_eq!(recorder_slot(BusId(15)).0, 47);
         assert_eq!(output_index(PortSlot(48)), None);
+    }
+
+    #[test]
+    fn push_frames_never_stores_half_a_frame() {
+        let (_engine, mut ctl) = create_port_pool();
+        let mut port = ctl.acquire_input().unwrap();
+        let capacity = port.producer.slots();
+        // Leave room for exactly 5 samples: with 2 channels only 2 whole frames (4 samples) fit.
+        let fill = vec![0.0; capacity - 5];
+        assert_eq!(port.push(&fill), capacity - 5);
+        assert_eq!(port.push_frames(&[1.0; 8], 2), 4);
+        assert_eq!(
+            port.push_frames(&[1.0; 8], 2),
+            0,
+            "the odd slot stays empty"
+        );
+        // Nothing fits, or fewer samples than one frame: nothing is stored.
+        assert_eq!(port.push_frames(&[1.0; 3], 4), 0);
+        assert_eq!(port.push_frames(&[], 2), 0);
+        // A zero channel count is treated as mono instead of dividing by zero.
+        assert_eq!(port.push_frames(&[1.0], 0), 1);
     }
 
     #[test]

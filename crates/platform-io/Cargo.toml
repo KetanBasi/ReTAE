@@ -1,6 +1,6 @@
 [package]
 name = "platform-io"
-description = "AudioBackend trait, mock backend and timer master clock (real backends: S5 PipeWire, S6 WASAPI, S8 AAudio)"
+description = "AudioBackend trait, mock backend, timer master clock and the Linux backends (PipeWire, ALSA); WASAPI is S6, AAudio S8"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,3 +10,30 @@ publish.workspace = true
 audio-types.workspace = true
 audio-engine.workspace = true
 serde.workspace = true
+
+# * Every feature below binds a C library, so none is on by default and
+# * `cargo test --workspace` needs no C toolchain or system package (CLAUDE.md law 3 spirit).
+#   pipewire: libpipewire-0.3-dev, libspa-0.2-dev, libclang (bindgen)
+#   alsa:     libasound2-dev
+#   rt:       libdbus-1-dev (rtkit over D-Bus)
+[features]
+default = []
+pipewire = ["dep:pipewire"]
+alsa = ["dep:cpal"]
+rt = ["dep:audio_thread_priority"]
+
+# ? Only the live PipeWire test uses rtrb directly (for the engine's command queue type).
+[dev-dependencies]
+rtrb.workspace = true
+
+[dependencies.pipewire]
+workspace = true
+optional = true
+
+[dependencies.cpal]
+workspace = true
+optional = true
+
+[dependencies.audio_thread_priority]
+workspace = true
+optional = true

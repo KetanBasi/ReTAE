@@ -19,7 +19,8 @@ USAGE:
 
 OPTIONS:
     --name <NAME>            name other machines see            (default: ReTAE)
-    --backend <KIND>         audio backend: mock                (default: mock)
+    --backend <KIND>         audio backend: mock, pipewire, alsa, auto
+                             (default: auto if this build has a real backend, else mock)
     --port <PORT>            UDP port for VBAN audio            (default: 6980)
     --discovery              announce and browse over mDNS
     --instance <NAME>        run next to another routerd (separate IPC name)
@@ -30,7 +31,10 @@ OPTIONS:
 ";
 
 fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Options>, String> {
-    let mut o = Options::default();
+    let mut o = Options {
+        backend: BackendKind::preferred(),
+        ..Options::default()
+    };
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let mut value = |what: &str| args.next().ok_or_else(|| format!("{arg} needs {what}"));
@@ -72,6 +76,12 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // ? Must be set before the daemon starts: a network thread asks for real-time priority when
+    // ? it begins, and the hook is read then. (Rx/Tx threads wake about once a millisecond, so
+    // ? 48 frames is the period we tell the scheduler.)
+    net_vban::hook::set_thread_start_hook(|_role| {
+        let _ = platform_io::rt::promote_current_thread(48, 48_000);
+    });
     let daemon = match Daemon::start(options) {
         Ok(d) => d,
         Err(DaemonError::AlreadyRunning(name)) => {
@@ -84,10 +94,29 @@ fn main() -> ExitCode {
         }
     };
     println!(
-        "routerd: running; VBAN on UDP {}, IPC {:?}",
+        "routerd: running; backend {}, VBAN on UDP {}, IPC {:?}",
+        daemon.backend_name(),
         daemon.control().rx_port(),
         daemon.ipc_name()
     );
+    // The mixer thread reports within a moment whether it got real-time priority. Saying so
+    // matters: without it audio still works, but a busy machine can cause dropouts.
+    let report = daemon.master().stats().clone();
+    for _ in 0..50 {
+        if report.rt.get().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    match report.rt.get() {
+        Some(platform_io::rt::RtOutcome::Promoted) => {
+            println!("routerd: mixer thread has real-time priority");
+        }
+        Some(platform_io::rt::RtOutcome::Unavailable(why)) => {
+            println!("routerd: mixer thread runs at normal priority ({why})");
+        }
+        None => println!("routerd: mixer thread priority not reported yet"),
+    }
     // ? There is no signal handling yet: Ctrl-C ends the process and the OS reclaims the
     // ? sockets and threads. A clean shutdown (devices closed in order) arrives with the tray
     // ? helper, which owns the lifetime of the daemon.
@@ -129,11 +158,28 @@ mod tests {
     }
 
     #[test]
+    fn every_backend_name_parses_in_every_build() {
+        for (name, kind) in [
+            ("mock", BackendKind::Mock),
+            ("pipewire", BackendKind::PipeWire),
+            ("alsa", BackendKind::Alsa),
+            ("auto", BackendKind::Auto),
+        ] {
+            let o = parse(args(&["--backend", name])).unwrap().unwrap();
+            assert_eq!(o.backend, kind);
+            assert_eq!(kind.as_str(), name);
+        }
+        // No flag: the build's preferred backend.
+        let o = parse(args(&[])).unwrap().unwrap();
+        assert_eq!(o.backend, BackendKind::preferred());
+    }
+
+    #[test]
     fn bad_options_say_what_is_wrong() {
         for bad in [
             &["--port"][..],
             &["--port", "99999"],
-            &["--backend", "alsa"],
+            &["--backend", "wasapi"],
             &["--device-target-ms", "0"],
             &["--device-target-ms", "nan"],
             &["--frobnicate"],

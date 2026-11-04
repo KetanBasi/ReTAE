@@ -467,6 +467,7 @@ fn run(
     stop: &AtomicBool,
     stats: &TxStats,
 ) -> Consumer<f32> {
+    crate::hook::thread_started(crate::hook::ThreadRole::Tx);
     // ? Held for the thread's life: Windows needs the 1 ms timer request or the tick is 15 ms.
     let _timer = TimerResolution::request_1ms();
     let mut send = |pkt: &[u8]| socket.send_to(pkt, dest).map(|_| ());
