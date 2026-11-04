@@ -118,6 +118,15 @@ impl<R: DriftResampler> ClockDomainAdapter<R> {
         self.overruns = 0;
     }
 
+    /// Change the target while running: no reset, no re-priming, the learned offset stays.
+    /// A non-finite value is ignored.
+    pub fn set_target_ms(&mut self, target_ms: f32) {
+        if target_ms.is_finite() {
+            self.target_ms = target_ms.clamp(MIN_TARGET_MS, MAX_TARGET_MS);
+            self.controller.set_target_ms(self.target_ms);
+        }
+    }
+
     /// Applied ratio correction in ppm (published as `drift_ppm`).
     pub fn drift_ppm(&self) -> f32 {
         self.controller.ppm()

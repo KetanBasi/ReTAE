@@ -65,6 +65,8 @@ pub struct ViewState {
     pub simple: SimpleState,
     /// Text box of the profile menu.
     pub profile_name: String,
+    /// The Patchbay Cards view: card springs, the wire being pulled, the selected wire.
+    pub patch: crate::patchbay::PatchState,
 }
 
 /// What is picked in the two Simple-mode cards. Indices into lists that are rebuilt every frame,
@@ -105,6 +107,7 @@ impl Default for ViewState {
             edit: EditBuffers::default(),
             simple: SimpleState::default(),
             profile_name: String::new(),
+            patch: crate::patchbay::PatchState::default(),
         }
     }
 }

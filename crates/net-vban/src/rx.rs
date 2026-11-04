@@ -226,6 +226,12 @@ enum Cmd {
         reply: Sender<Option<Box<StreamRx>>>,
     },
     SetPolicy(RxPolicy),
+    /// Adaptive mode (N3): raise a running stream's jitter target above its preset.
+    /// `None` goes back to the preset.
+    SetTargetOverride {
+        key: StreamKey,
+        ms: Option<f32>,
+    },
 }
 
 #[derive(Debug)]
@@ -362,6 +368,14 @@ impl RxSocket {
             .send(Cmd::SetPolicy(policy))
             .map_err(|_| RxError::ThreadGone)
     }
+
+    /// Move the jitter target of the stream `key` (the stream's own `target_ms` counter follows).
+    /// Fire and forget: the receive thread applies it at the top of its next loop.
+    pub fn set_target_override(&self, key: StreamKey, ms: Option<f32>) -> Result<(), RxError> {
+        self.cmd
+            .send(Cmd::SetTargetOverride { key, ms })
+            .map_err(|_| RxError::ThreadGone)
+    }
 }
 
 impl Drop for RxSocket {
@@ -469,6 +483,11 @@ impl Worker {
                     let _ = reply.send(found);
                 }
                 Cmd::SetPolicy(p) => self.policy = p,
+                Cmd::SetTargetOverride { key, ms } => {
+                    if let Some(e) = self.streams.iter_mut().find(|e| e.key == key) {
+                        e.rx.set_target_override_ms(ms);
+                    }
+                }
             }
         }
     }

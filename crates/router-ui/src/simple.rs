@@ -245,6 +245,7 @@ pub fn receive_streams(
                 source_ipv4: s.ip,
                 stream_name: FixedStr::from_str_trunc(&s.stream_name),
                 buffer,
+                adaptive: true,
             },
             u8::try_from(s.channels).unwrap_or(2).clamp(1, 8),
         ));
@@ -255,6 +256,7 @@ pub fn receive_streams(
             source_ipv4: [0, 0, 0, 0],
             stream_name: FixedStr::from_str_trunc("Stream1"),
             buffer,
+            adaptive: true,
         },
         2,
     ));

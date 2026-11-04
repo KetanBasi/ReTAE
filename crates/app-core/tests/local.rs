@@ -4,6 +4,7 @@
 //! microVM where 1 ms sleeps sometimes wake 3 to 30 ms late; there the checks relax and say so.
 
 use app_core::ipc::{IpcServer, RemoteControl};
+use app_core::recorder::RecordFormat;
 use app_core::types::{Command, ControlError, DiscoveryState, LinkState, ProbeRequest};
 use app_core::{ControlApi, DaemonConfig, LocalControl};
 use audio_engine::create_engine;
@@ -63,6 +64,8 @@ impl Rig {
                     discovery: false,
                     device_target_ms: 8.0,
                     config_dir: dir.0.clone(),
+                    recordings_dir: dir.0.join("recordings"),
+                    record_format: RecordFormat::default(),
                 },
             )
             .expect("LocalControl::new"),
@@ -310,6 +313,266 @@ fn audio_flows_from_a_mock_input_through_the_mixer_to_a_mock_output() {
     );
 }
 
+// SECTION: Recording
+/// The one file in `<rig dir>/recordings` with this extension.
+fn recorded_files(rig: &Rig, ext: &str) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(rig._dir.0.join("recordings"))
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == ext))
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+fn recorded_frames(rig: &Rig, bus: usize) -> u64 {
+    rig.control.snapshot().unwrap().buses[bus]
+        .recording
+        .as_ref()
+        .map_or(0, |r| r.frames)
+}
+
+#[test]
+fn recording_a_bus_writes_the_mixer_output_to_a_wav_file() {
+    let rig = Rig::new("rec-wav");
+    rig.wire_sine_to_speakers();
+    rig.cmd(Command::BusRecord {
+        bus: 0,
+        enabled: true,
+    });
+
+    let snap = rig.control.snapshot().unwrap();
+    assert!(snap.buses[0].config.record);
+    assert!(snap.buses[0].record_error.is_none());
+    wait_until("one second recorded", Duration::from_secs(10), || {
+        recorded_frames(&rig, 0) >= 48_000
+    });
+    rig.cmd(Command::BusRecord {
+        bus: 0,
+        enabled: false,
+    });
+    let snap = rig.control.snapshot().unwrap();
+    assert!(!snap.buses[0].config.record);
+    assert!(snap.buses[0].recording.is_none(), "stopping ends the take");
+
+    let files = recorded_files(&rig, "wav");
+    assert_eq!(files.len(), 1, "{files:?}");
+    let name = files[0].file_name().unwrap().to_string_lossy().to_string();
+    assert!(
+        name.contains("bus1") && name.starts_with("test-rec-wav"),
+        "{name}"
+    );
+
+    let mut reader = hound::WavReader::open(&files[0]).unwrap();
+    let spec = reader.spec();
+    assert_eq!((spec.channels, spec.sample_rate), (2, 48_000));
+    assert_eq!(spec.bits_per_sample, 24);
+    assert!(reader.duration() >= 48_000, "{} frames", reader.duration());
+    let samples: Vec<f32> = reader
+        .samples::<i32>()
+        .map(|s| s.unwrap() as f32 / 8_388_607.0)
+        .collect();
+    // Skip the fader ramp at the start; the rest is a 0.5 sine at 1 kHz on both channels.
+    let tail = &samples[samples.len() / 2..];
+    let peak = tail.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    assert!((0.45..0.55).contains(&peak), "peak {peak}");
+    let left: Vec<f32> = tail.iter().step_by(2).copied().collect();
+    let crossings = left
+        .windows(2)
+        .filter(|w| w[0] <= 0.0 && w[1] > 0.0)
+        .count();
+    let seconds = left.len() as f32 / 48_000.0;
+    let hz = crossings as f32 / seconds;
+    assert!((980.0..1020.0).contains(&hz), "{hz} Hz");
+
+    // The ring went back to the pool: a second take works and is a second file.
+    rig.cmd(Command::BusRecord {
+        bus: 0,
+        enabled: true,
+    });
+    wait_until("a second take", Duration::from_secs(10), || {
+        recorded_frames(&rig, 0) >= 4_800
+    });
+    rig.cmd(Command::BusRecord {
+        bus: 0,
+        enabled: false,
+    });
+    assert_eq!(recorded_files(&rig, "wav").len(), 2);
+    assert_eq!(rig.rejected(), 0);
+}
+
+#[test]
+fn a_flac_recording_decodes() {
+    let dir = TempDir::new("rec-flac");
+    let (engine, handles) = create_engine();
+    let (backend, mock) = MockBackend::new();
+    let control = Arc::new(
+        LocalControl::new(
+            handles,
+            Box::new(backend),
+            DaemonConfig {
+                name: "flac".into(),
+                rx_port: 0,
+                config_dir: dir.0.clone(),
+                recordings_dir: dir.0.join("rec"),
+                record_format: RecordFormat::Flac,
+                ..DaemonConfig::default()
+            },
+        )
+        .unwrap(),
+    );
+    let _master = TimerMaster::spawn(engine, 0.0).unwrap();
+    mock.set_signal(
+        "mock-in-1",
+        Signal::Sine {
+            freq_hz: 440.0,
+            amp: 0.5,
+        },
+    );
+    let speakers = SinkEndpoint::HardwareOutput {
+        device_id: FixedStr::from_str_trunc("mock-out-1"),
+    };
+    let mic = SourceEndpoint::HardwareInput {
+        device_id: FixedStr::from_str_trunc("mock-in-1"),
+    };
+    control
+        .command(Command::BusSink {
+            bus: 0,
+            sink: speakers,
+            channels: 2,
+        })
+        .unwrap();
+    control
+        .command(Command::Route {
+            strip: 0,
+            bus: 0,
+            send: RouteSend {
+                enabled: true,
+                gain_db: 0.0,
+                pre_fader: false,
+            },
+        })
+        .unwrap();
+    control
+        .command(Command::StripSource {
+            strip: 0,
+            source: mic,
+            channels: 2,
+        })
+        .unwrap();
+    control
+        .command(Command::BusRecord {
+            bus: 0,
+            enabled: true,
+        })
+        .unwrap();
+    wait_until("1.5 s recorded", Duration::from_secs(10), || {
+        control.snapshot().unwrap().buses[0]
+            .recording
+            .as_ref()
+            .is_some_and(|r| r.frames >= 72_000)
+    });
+    // Dropping the control closes the file, like a daemon shutting down mid-take.
+    drop(control);
+
+    let files: Vec<PathBuf> = std::fs::read_dir(dir.0.join("rec"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(files[0].extension().unwrap(), "flac");
+    let bytes = std::fs::read(&files[0]).unwrap();
+    assert_eq!(&bytes[..4], b"fLaC");
+
+    // A real decoder, when the machine has one. `-count_frames` decodes every frame and `-v error`
+    // prints a line for each damaged one.
+    if let Ok(out) = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-count_frames", "-select_streams", "a:0"])
+        .args([
+            "-show_entries",
+            "stream=codec_name,channels,sample_rate,nb_read_frames",
+        ])
+        .args(["-of", "default=nw=1"])
+        .arg(&files[0])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success() && err.trim().is_empty(), "{text}{err}");
+        assert!(text.contains("codec_name=flac"), "{text}");
+        assert!(
+            text.contains("channels=2") && text.contains("sample_rate=48000"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn a_recording_that_cannot_start_says_why_and_leaves_the_bus_alone() {
+    let rig = Rig::new("rec-fail");
+    // A file where the recordings folder should be.
+    std::fs::write(rig._dir.0.join("recordings"), b"not a folder").unwrap();
+    let err = rig
+        .control
+        .command(Command::BusRecord {
+            bus: 0,
+            enabled: true,
+        })
+        .unwrap_err();
+    assert!(matches!(err, ControlError::Backend(_)), "{err:?}");
+    let snap = rig.control.snapshot().unwrap();
+    assert!(!snap.buses[0].config.record);
+    assert!(snap.buses[0].record_error.is_some());
+    assert!(snap.buses[0].recording.is_none());
+    // The ring is back in the pool: after the folder is fixed, recording works.
+    std::fs::remove_file(rig._dir.0.join("recordings")).unwrap();
+    rig.cmd(Command::BusRecord {
+        bus: 0,
+        enabled: true,
+    });
+    assert!(
+        rig.control.snapshot().unwrap().buses[0]
+            .record_error
+            .is_none()
+    );
+    assert_eq!(rig.rejected(), 0);
+}
+
+#[test]
+fn a_recording_follows_the_buses_channel_count() {
+    let rig = Rig::new("rec-ch");
+    rig.wire_sine_to_speakers();
+    rig.cmd(Command::BusRecord {
+        bus: 0,
+        enabled: true,
+    });
+    // Re-open the bus with 1 channel: the stereo file is closed (empty, so removed) and a mono one
+    // is started.
+    rig.cmd(Command::BusSink {
+        bus: 0,
+        sink: rig.speakers(),
+        channels: 1,
+    });
+    wait_until("mono audio recorded", Duration::from_secs(10), || {
+        recorded_frames(&rig, 0) >= 4_800
+    });
+    rig.cmd(Command::BusRecord {
+        bus: 0,
+        enabled: false,
+    });
+    let files = recorded_files(&rig, "wav");
+    let channels: Vec<u16> = files
+        .iter()
+        .map(|p| hound::WavReader::open(p).unwrap().spec().channels)
+        .collect();
+    assert!(channels.contains(&1), "{channels:?}");
+}
+// !SECTION: Recording
+
 #[test]
 fn closing_an_endpoint_frees_the_device_and_the_ring() {
     let rig = Rig::new("close");
@@ -554,6 +817,109 @@ fn remote_text_commands_obey_the_receive_policy() {
     });
 }
 
+/// A second rig that trusts loopback, so it obeys the first one's remote commands.
+fn trusting_peer(tag: &str) -> Rig {
+    let peer = Rig::new(tag);
+    peer.cmd(Command::RxPolicy {
+        accept_any: false,
+        allowed: vec![[127, 0, 0, 1]],
+        trust_discovered: false,
+    });
+    // ? The socket thread picks the policy up between receives (<= 5 ms).
+    std::thread::sleep(Duration::from_millis(30));
+    peer
+}
+
+#[test]
+fn one_control_can_command_another_over_vban_text() {
+    let me = Rig::new("peer-a");
+    let peer = trusting_peer("peer-b");
+    let dest = loopback(peer.control.rx_port());
+
+    me.cmd(Command::PeerText {
+        peer: dest,
+        text: "Strip[0].Gain=-4.5; Bus[1].Mute=1; Strip[1].Solo=1; Strip[1].Pan_x=0.25;".into(),
+    });
+    wait_until("the remote commands", Duration::from_secs(3), || {
+        let s = peer.control.snapshot().unwrap();
+        s.strips[0].config.gain_db == -4.5
+            && s.buses[1].config.mute
+            && s.strips[1].config.solo
+            && (s.strips[1].config.pan - 0.5).abs() < 1e-6
+    });
+    // The sender's own state is untouched.
+    let mine = me.control.snapshot().unwrap();
+    assert_eq!(mine.strips[0].config.gain_db, 0.0);
+    assert!(!mine.buses[1].config.mute);
+}
+
+#[test]
+fn a_remote_route_switch_keeps_the_sends_gain() {
+    let me = Rig::new("route-a");
+    let peer = trusting_peer("route-b");
+    peer.cmd(Command::Route {
+        strip: 0,
+        bus: 1,
+        send: RouteSend {
+            enabled: false,
+            gain_db: -7.0,
+            pre_fader: true,
+        },
+    });
+    let dest = loopback(peer.control.rx_port());
+    // ? VoiceMeeter names the buses A1.. then B1..; B1 is our bus 5 only on a Potato layout,
+    // ? so ask for the first (A2 = Bus[1]).
+    me.cmd(Command::PeerText {
+        peer: dest,
+        text: "Strip[0].A2=1;".into(),
+    });
+    wait_until("the route", Duration::from_secs(3), || {
+        peer.control.snapshot().unwrap().strips[0].config.sends[1].enabled
+    });
+    let send = peer.control.snapshot().unwrap().strips[0].config.sends[1];
+    assert_eq!(send.gain_db, -7.0);
+    assert!(send.pre_fader);
+}
+
+#[test]
+fn peer_commands_must_be_unicast_short_plain_text() {
+    let me = Rig::new("peer-bad");
+    let send = |peer: SocketAddrV4, text: &str| {
+        me.control.command(Command::PeerText {
+            peer,
+            text: text.into(),
+        })
+    };
+    let good = loopback(6980);
+    assert!(
+        send(
+            SocketAddrV4::new(Ipv4Addr::BROADCAST, 6980),
+            "Bus[0].Mute=1;"
+        )
+        .is_err()
+    );
+    assert!(
+        send(
+            SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 1), 6980),
+            "Bus[0].Mute=1;"
+        )
+        .is_err()
+    );
+    assert!(
+        send(
+            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 6980),
+            "Bus[0].Mute=1;"
+        )
+        .is_err()
+    );
+    assert!(send(loopback(0), "Bus[0].Mute=1;").is_err());
+    assert!(send(good, "   ").is_err());
+    assert!(send(good, &"a".repeat(513)).is_err());
+    assert!(send(good, "Bus[0].Mute=1;\u{0}").is_err());
+    // A well-formed one to a unicast address is accepted (UDP: nobody has to be listening).
+    assert!(send(good, "Bus[0].Mute=1;").is_ok());
+}
+
 #[test]
 fn a_lan_stream_from_a_named_source_arrives_and_unnamed_senders_are_listed() {
     let rx = Rig::new("lan-rx");
@@ -578,6 +944,7 @@ fn a_lan_stream_from_a_named_source_arrives_and_unnamed_senders_are_listed() {
             source_ipv4: [127, 0, 0, 1],
             stream_name: FixedStr::from_str_trunc("Link"),
             buffer: NetworkBufferPreset::Fast,
+            adaptive: false,
         }),
         channels: 2,
     });
@@ -673,6 +1040,80 @@ fn a_lan_stream_from_a_named_source_arrives_and_unnamed_senders_are_listed() {
         rx.control.snapshot().unwrap().discovery,
         DiscoveryState::Off
     );
+}
+#[test]
+fn the_mixer_follows_the_receive_streams_target_when_the_packet_size_is_learned() {
+    // Optimal is a 6 ms floor, but 256-frame packets last 5.33 ms and the stream wants two of
+    // them (10.67 ms). The strip is attached before any packet arrives, so only the housekeeping
+    // tuner can bring the mixer's target to the same number.
+    let rx = Rig::new("tune-rx");
+    rx.cmd(Command::BusSink {
+        bus: 0,
+        sink: rx.speakers(),
+        channels: 2,
+    });
+    rx.cmd(Command::Route {
+        strip: 0,
+        bus: 0,
+        send: RouteSend {
+            enabled: true,
+            gain_db: 0.0,
+            pre_fader: false,
+        },
+    });
+    rx.cmd(Command::StripSource {
+        strip: 0,
+        source: SourceEndpoint::LanIn(LanRxConfig {
+            source_ipv4: [127, 0, 0, 1],
+            stream_name: FixedStr::from_str_trunc("Tune"),
+            buffer: NetworkBufferPreset::Optimal,
+            adaptive: true,
+        }),
+        channels: 2,
+    });
+    wait_until("the attach-time target", Duration::from_secs(3), || {
+        (rx.control.meters().unwrap().lan_rx[0].target_ms - 6.0).abs() < 0.1
+    });
+
+    let tx = Rig::new("tune-tx");
+    tx.mock.set_signal(
+        "mock-in-1",
+        Signal::Sine {
+            freq_hz: 500.0,
+            amp: 0.5,
+        },
+    );
+    tx.cmd(Command::Route {
+        strip: 0,
+        bus: 0,
+        send: RouteSend {
+            enabled: true,
+            gain_db: 0.0,
+            pre_fader: false,
+        },
+    });
+    tx.cmd(Command::StripSource {
+        strip: 0,
+        source: tx.mic(),
+        channels: 2,
+    });
+    tx.cmd(Command::BusSink {
+        bus: 0,
+        sink: SinkEndpoint::LanOut(LanTxConfig {
+            peer_ipv4: [127, 0, 0, 1],
+            port: rx.control.rx_port(),
+            stream_name: FixedStr::from_str_trunc("Tune"),
+            frames_per_packet: 256,
+            ..LanTxConfig::default()
+        }),
+        channels: 2,
+    });
+    wait_until(
+        "the mixer's target to reach two packets",
+        Duration::from_secs(8),
+        || (rx.control.meters().unwrap().lan_rx[0].target_ms - 10.667).abs() < 0.2,
+    );
+    assert_eq!(rx.rejected(), 0);
 }
 // !SECTION: Network
 

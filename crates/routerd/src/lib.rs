@@ -12,12 +12,14 @@
 #![forbid(unsafe_code)]
 
 use app_core::ipc::{self, IpcError, IpcServer};
+use app_core::lan::{self, LanServer, PairingCode};
 use app_core::{ControlApi, DaemonConfig, LocalControl, paths};
 use audio_engine::create_engine;
 use platform_io::{AudioBackend, MockBackend, MockControl, TimerMaster};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 // SECTION: Options
 /// Which audio backend the daemon uses.
@@ -174,7 +176,17 @@ pub struct Options {
     pub master_ppm: f64,
     /// Profile to load at start.
     pub profile: Option<String>,
+    /// Where bus recordings are written.
+    pub recordings_dir: PathBuf,
+    pub record_format: app_core::recorder::RecordFormat,
+    /// TCP port for control from other machines (encrypted, paired devices only). `None` = off.
+    pub lan_control: Option<u16>,
+    /// Open a pairing window as soon as the LAN service is up (needs `lan_control`).
+    pub pair: bool,
 }
+
+/// How long a pairing window stays open.
+pub const PAIRING_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl Default for Options {
     fn default() -> Self {
@@ -189,6 +201,10 @@ impl Default for Options {
             device_target_ms: cfg.device_target_ms,
             master_ppm: 0.0,
             profile: None,
+            recordings_dir: cfg.recordings_dir,
+            record_format: cfg.record_format,
+            lan_control: None,
+            pair: false,
         }
     }
 }
@@ -220,6 +236,8 @@ impl std::error::Error for DaemonError {}
 // ? then stop the mixer (`master`), and only then close devices and sockets (`control`). The
 // ? other order would let a device thread feed a mixer that no longer runs.
 pub struct Daemon {
+    lan: Option<LanServer>,
+    pairing_code: Option<PairingCode>,
     ipc: Option<IpcServer>,
     master: TimerMaster,
     control: Arc<LocalControl>,
@@ -238,9 +256,17 @@ impl Daemon {
             return Err(DaemonError::AlreadyRunning(ipc_name));
         }
 
+        if options.pair && options.lan_control.is_none() {
+            return Err(DaemonError::Start(
+                "--pair needs --lan-control (there is nothing to pair with otherwise)".into(),
+            ));
+        }
+
         let (engine, handles) = create_engine();
         let (backend, mock) = make_backend(options.backend)?;
         let backend_name = backend.name();
+        let name = options.name.clone();
+        let config_dir = options.config_dir.clone();
         let control = Arc::new(
             LocalControl::new(
                 handles,
@@ -251,6 +277,8 @@ impl Daemon {
                     discovery: options.discovery,
                     device_target_ms: options.device_target_ms,
                     config_dir: options.config_dir,
+                    recordings_dir: options.recordings_dir,
+                    record_format: options.record_format,
                 },
             )
             .map_err(|e| DaemonError::Start(e.to_string()))?,
@@ -270,7 +298,36 @@ impl Daemon {
             IpcError::Io(e) => DaemonError::Start(format!("cannot open the IPC socket: {e}")),
         })?;
 
+        // SECTION: LAN control
+        let mut lan = None;
+        let mut pairing_code = None;
+        if let Some(port) = options.lan_control {
+            let start = || -> std::io::Result<LanServer> {
+                let identity =
+                    lan::Identity::load_or_create(&paths::lan_identity_path(&config_dir))?;
+                let book = lan::PeerBook::load(&paths::lan_peers_path(&config_dir))?;
+                LanServer::start(
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+                    &name,
+                    identity,
+                    Arc::new(Mutex::new(book)),
+                    Arc::downgrade(&as_dyn),
+                )
+            };
+            let server = start()
+                .map_err(|e| DaemonError::Start(format!("cannot start LAN control: {e}")))?;
+            if options.pair {
+                pairing_code = Some(server.open_pairing(PAIRING_WINDOW).map_err(|e| {
+                    DaemonError::Start(format!("cannot open a pairing window: {e}"))
+                })?);
+            }
+            lan = Some(server);
+        }
+        // !SECTION: LAN control
+
         Ok(Self {
+            lan,
+            pairing_code,
             ipc: Some(ipc),
             master,
             control,
@@ -302,6 +359,21 @@ impl Daemon {
     /// The name a client connects to.
     pub fn ipc_name(&self) -> &str {
         &self.ipc_name
+    }
+
+    /// Where LAN control listens, when it is on.
+    pub fn lan_addr(&self) -> Option<SocketAddr> {
+        self.lan.as_ref().map(LanServer::local_addr)
+    }
+
+    /// The code of the pairing window opened at start (`--pair`), to show to a person.
+    pub fn pairing_code(&self) -> Option<&PairingCode> {
+        self.pairing_code.as_ref()
+    }
+
+    /// Open (or renew) a pairing window. `None` if LAN control is off.
+    pub fn open_pairing(&self) -> Option<std::io::Result<PairingCode>> {
+        self.lan.as_ref().map(|l| l.open_pairing(PAIRING_WINDOW))
     }
 
     /// Stop answering IPC requests now (also happens on drop).

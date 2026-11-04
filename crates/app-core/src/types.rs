@@ -1,6 +1,7 @@
 //! Everything that crosses the `ControlApi` boundary. All of it is plain serde data, so the
 //! same types serve an in-process UI and the IPC protocol.
 
+pub use crate::recorder::{RecordFormat, RecordingState};
 use crate::ui_state::UiLayout;
 use audio_types::{
     BusConfig, EqBand, RouteSend, SinkEndpoint, SourceEndpoint, StripConfig, StripDsp,
@@ -10,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddrV4;
 
 /// Bumped whenever a message changes shape. The IPC handshake refuses a mismatch.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 // SECTION: Errors
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +130,13 @@ pub enum Command {
     Ping {
         peer: SocketAddrV4,
     },
+    /// Send VBAN-TEXT to `peer` (a VoiceMeeter on another PC, or another ReTAE), e.g.
+    /// `Strip[0].Gain=-6; Bus[1].Mute=1`. The text is passed as typed, so a VoiceMeeter peer
+    /// understands its whole command language, not only what this router accepts (N7).
+    PeerText {
+        peer: SocketAddrV4,
+        text: String,
+    },
     Ui(UiLayout),
     SaveProfile {
         name: String,
@@ -177,6 +185,10 @@ pub struct BusState {
     pub stream: Option<StreamStats>,
     /// LAN output only.
     pub tx: Option<TxState>,
+    /// The file being written while `config.record` is on.
+    pub recording: Option<RecordingState>,
+    /// Why the last attempt to start a recording failed (folder not writable, no free ring).
+    pub record_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

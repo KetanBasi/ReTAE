@@ -272,6 +272,7 @@ mod tests {
             source_ipv4: [192, 168, 1, 20],
             stream_name: FixedStr::from_str_trunc("Stream1"),
             buffer: NetworkBufferPreset::Custom { target_ms: 30 },
+            adaptive: true,
         });
         p.strips[2].source = SourceEndpoint::ProcessLoopback {
             pid: 4242,

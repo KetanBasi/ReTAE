@@ -40,6 +40,33 @@ fn env_path(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Environment variable that moves the recordings directory.
+pub const RECORDINGS_DIR_ENV: &str = "RETAE_RECORDINGS_DIR";
+
+/// Where bus recordings go: `$RETAE_RECORDINGS_DIR`, else `~/Music/ReTAE`, else `./recordings`.
+// ? Android has no such home folder: the host passes `getExternalFilesDir` through
+// ? `DaemonConfig::recordings_dir` instead (J9).
+pub fn recordings_dir() -> PathBuf {
+    if let Some(dir) = env_path(RECORDINGS_DIR_ENV) {
+        return dir;
+    }
+    if let Some(home) = env_path("HOME").or_else(|| env_path("USERPROFILE")) {
+        return home.join("Music").join("ReTAE");
+    }
+    PathBuf::from("recordings")
+}
+
+/// This machine's long-term key for LAN control (`lan::Identity`). Holds a private key.
+pub fn lan_identity_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("lan-identity.toml")
+}
+
+/// Who this machine trusts for LAN control (`lan::PeerBook`): controllers on a daemon,
+/// daemons on a controller.
+pub fn lan_peers_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("lan-peers.toml")
+}
+
 pub fn profiles_dir(config_dir: &Path) -> PathBuf {
     config_dir.join("profiles")
 }

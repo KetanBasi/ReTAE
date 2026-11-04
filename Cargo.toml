@@ -77,6 +77,19 @@ egui_kittest = "0.32.3"
 # ? written against and it is plenty for AudioRecord / WifiLock / PackageManager calls.
 ndk = { version = "0.9.0", default-features = false, features = ["audio", "api-level-29"] }
 jni = "0.21.1"
+# * S9 (recording, C4). Both pure Rust, so the PCM-only build still needs no C toolchain.
+# ? flacenc without default features: `par` (crossbeam threads) and `serde` are not needed, the
+# ? recorder encodes one block at a time on its own thread. `hound` writes WAV (16/24-bit int, f32).
+hound = "3.5.1"
+flacenc = { version = "0.5.1", default-features = false }
+# * S9 (control over the LAN). `snow` is a pure-Rust Noise implementation (no C toolchain). The
+# * Only X25519, ChaCha20-Poly1305 and BLAKE2s are enabled, which is all the pattern uses.
+# !! Do not turn the default features back on: snow's `std` feature enables `ring/std`, which pulls
+# !! in `ring` (C and assembly). That needs a C compiler (the NDK for Android) and breaks the
+# !! "PCM-only build needs no C toolchain" rule in CLAUDE.md law 3.
+# ? getrandom is named only for the pairing code: it is already in the tree through snow (0.3.x).
+snow = { version = "0.10.0", default-features = false, features = ["default-resolver", "use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"] }
+getrandom = "0.3.4"
 # !SECTION: Workspace
 
 # SECTION: Profiles

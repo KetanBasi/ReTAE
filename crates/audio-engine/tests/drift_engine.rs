@@ -274,3 +274,72 @@ fn drift_engine_silent_producer_gives_silence_then_recovers_without_noise() {
     assert!(heard.iter().all(|v| v.is_finite()));
     assert_eq!(rig.h.stats.input_underruns.load(Relaxed) - underruns0, 0);
 }
+
+#[test]
+fn a_new_target_is_followed_live_without_a_reset_or_a_glitch() {
+    let mut rig = external_rig(12.0);
+    rig.process(1);
+    let underruns0 = rig.h.stats.input_underruns.load(Relaxed);
+    let mut prod = Producer::new(0.0);
+    prod.push(&mut rig, 0, 12 * 48);
+    let max_tone_step = AMP * 2.0 * (core::f32::consts::PI / TABLE as f32).sin();
+    let mut prev = 0.0_f32;
+    // Returns the largest sample-to-sample step heard during the run.
+    let mut run = |rig: &mut Rig, prod: &mut Producer, blocks: usize| -> f32 {
+        let mut worst = 0.0_f32;
+        for _ in 0..blocks {
+            let n = prod.frames_this_block();
+            prod.push(rig, 0, n);
+            rig.process(1);
+            for &v in chan(&rig.drain(0), 2, 0).iter() {
+                worst = worst.max((v - prev).abs());
+                prev = v;
+            }
+        }
+        worst
+    };
+    let _ = run(&mut rig, &mut prod, 750); // 2 s: primed and steady
+    assert!((load_f32(&rig.tel().lan_rx[0].target_ms) - 12.0).abs() < 0.01);
+
+    rig.send(C::SetStripTarget {
+        strip: StripId(0),
+        target_ms: 30.0,
+    });
+    let worst_step = run(&mut rig, &mut prod, 750);
+    assert!(
+        (load_f32(&rig.tel().lan_rx[0].target_ms) - 30.0).abs() < 0.01,
+        "telemetry shows the new target"
+    );
+    assert!(
+        worst_step < max_tone_step * 1.5,
+        "no click when the target moves: step x{:.3}",
+        worst_step / max_tone_step
+    );
+    assert_eq!(
+        rig.h.stats.input_underruns.load(Relaxed) - underruns0,
+        0,
+        "moving the target must not re-prime the strip"
+    );
+    assert_eq!(rig.h.stats.rejected_commands.load(Relaxed), 0);
+
+    // Garbage is refused and counted; the target stays.
+    rig.send(C::SetStripTarget {
+        strip: StripId(0),
+        target_ms: f32::NAN,
+    });
+    run(&mut rig, &mut prod, 10);
+    assert_eq!(rig.h.stats.rejected_commands.load(Relaxed), 1);
+    assert!((load_f32(&rig.tel().lan_rx[0].target_ms) - 30.0).abs() < 0.01);
+}
+
+#[test]
+fn a_new_target_on_the_master_clock_changes_nothing() {
+    let mut rig = Rig::unity();
+    rig.send(C::SetStripTarget {
+        strip: StripId(0),
+        target_ms: 40.0,
+    });
+    rig.process(2);
+    assert_eq!(rig.h.stats.rejected_commands.load(Relaxed), 0);
+    assert_eq!(load_f32(&rig.tel().lan_rx[0].target_ms), 0.0);
+}

@@ -120,6 +120,7 @@ fn play_from_lan(this: &RemoteControl, s: u8, b: u8, name: &str) {
                 source_ipv4: [127, 0, 0, 1],
                 stream_name: FixedStr::from_str_trunc(name),
                 buffer: NetworkBufferPreset::Fast,
+                adaptive: false,
             }),
             channels: 2,
         },
@@ -201,6 +202,73 @@ fn a_restart_with_a_profile_restores_the_setup() {
     assert!(matches!(missing, Err(DaemonError::Start(_))));
 }
 // !SECTION: Single instance
+
+// SECTION: LAN control
+#[test]
+fn a_paired_device_drives_a_daemon_over_the_encrypted_lan_link() {
+    use app_core::lan::{self, Identity};
+    let dir = TempDir::new("lan");
+    // Off by default: nothing listens, and --pair without it is a mistake, not a silent no-op.
+    let off = Daemon::start(options("lan-off", &dir)).unwrap();
+    assert!(off.lan_addr().is_none() && off.pairing_code().is_none());
+    assert!(off.open_pairing().is_none());
+    drop(off);
+    let bad = Daemon::start(Options {
+        pair: true,
+        ..options("lan-bad", &dir)
+    });
+    assert!(matches!(bad, Err(DaemonError::Start(_))));
+
+    let daemon = Daemon::start(Options {
+        lan_control: Some(0),
+        pair: true,
+        ..options("lan", &dir)
+    })
+    .unwrap();
+    let port = daemon.lan_addr().unwrap().port();
+    let addr = (Ipv4Addr::LOCALHOST, port);
+    let code = daemon
+        .pairing_code()
+        .expect("--pair opens a window")
+        .clone();
+
+    let me_dir = TempDir::new("lan-me");
+    let me = Identity::load_or_create(&me_dir.0.join("id.toml")).unwrap();
+    let found = lan::pair(addr, &me, "phone", &code).unwrap();
+    assert_eq!(found.name, "daemon-lan");
+
+    let remote = lan::connect(addr, &me, "phone", &found.key).unwrap();
+    remote
+        .command(Command::StripGain {
+            strip: 2,
+            gain_db: -9.0,
+        })
+        .unwrap();
+    let snap = remote.snapshot().unwrap();
+    assert_eq!(snap.strips[2].config.gain_db, -9.0);
+    assert_eq!(snap.backend, "mock");
+    // The very same mixer answers on the local socket.
+    let local = RemoteControl::connect(daemon.ipc_name()).unwrap();
+    assert_eq!(local.snapshot().unwrap().strips[2].config.gain_db, -9.0);
+
+    // The pairing survives a restart: the daemon's peer book and key are on disk.
+    drop(remote);
+    drop(daemon);
+    let again = Daemon::start(Options {
+        lan_control: Some(0),
+        ..options("lan", &dir)
+    })
+    .unwrap();
+    assert!(again.pairing_code().is_none(), "no window unless asked for");
+    let addr = (Ipv4Addr::LOCALHOST, again.lan_addr().unwrap().port());
+    let remote = lan::connect(addr, &me, "phone", &found.key).unwrap();
+    assert_eq!(remote.snapshot().unwrap().strips[2].config.gain_db, 0.0);
+    // ...and a fresh window can pair a second device.
+    let second = Identity::generate().unwrap();
+    let code = again.open_pairing().unwrap().unwrap();
+    lan::pair(addr, &second, "tablet", &code).unwrap();
+}
+// !SECTION: LAN control
 
 // SECTION: Two daemons
 /// Strict on a quiet host; on a noisy one (1 ms sleeps waking 3 to 30 ms late) a few lost or

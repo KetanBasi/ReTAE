@@ -8,11 +8,13 @@
 
 mod format;
 
+use app_core::lan::{self, Identity, PairingCode, PeerBook};
 use app_core::types::{Command, ControlError, ProbeRequest};
-use app_core::{ControlApi, ControlResult};
+use app_core::{ControlApi, ControlResult, paths};
 use audio_types::{RouteSend, VBAN_DEFAULT_PORT};
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::path::Path;
 use std::str::FromStr;
 
 pub const HELP: &str = "\
@@ -31,6 +33,15 @@ COMMANDS:
     probe [<peer>] [--pings <N>] [--clicks <N>] [--no-click-loop]
                                      measure the round trip to <peer> (ip or ip:port, default
                                      port 6980) and the delay of this machine's mixer path
+";
+
+pub const LAN_HELP: &str = "\
+CONTROLLING ANOTHER MACHINE (its routerd must run with --lan-control):
+    router-cli pair <host[:port]> <code>
+                                     pair this device with that daemon using the one-time
+                                     code it printed (routerd --lan-control --pair)
+    router-cli --lan <host[:port]> <COMMAND>
+                                     run any command above on a paired daemon, encrypted
 ";
 
 /// Exit codes: 0 done, 1 the daemon said no or is unreachable, 2 wrong usage.
@@ -87,9 +98,94 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write, connect: C
 }
 
 fn usage(err: &mut dyn Write, message: &str) -> i32 {
-    let _ = writeln!(err, "router-cli: {message}\n\n{HELP}");
+    let _ = writeln!(err, "router-cli: {message}\n\n{HELP}\n{LAN_HELP}");
     EXIT_USAGE
 }
+
+// SECTION: Another machine
+/// Take `--lan <addr>` out of the arguments. Returns the address and what is left.
+pub fn split_lan(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
+    let mut lan = None;
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--lan" {
+            lan = Some(it.next().ok_or("--lan needs a host or host:port")?.clone());
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    Ok((lan, rest))
+}
+
+/// `host` or `host:port`; the port defaults to the LAN control port.
+fn lan_target(s: &str) -> String {
+    if s.contains(':') {
+        s.to_owned()
+    } else {
+        format!("{s}:{}", app_core::lan::DEFAULT_PORT)
+    }
+}
+
+/// A name for this device, shown on the daemon after pairing.
+const CLIENT_NAME: &str = "router-cli";
+
+/// Connect to a paired daemon over the LAN; keys live in `config_dir`.
+pub fn connect_lan(addr: &str, config_dir: &Path) -> ControlResult<Box<dyn ControlApi>> {
+    let files = |e: std::io::Error| ControlError::Invalid(format!("cannot read the keys: {e}"));
+    let identity =
+        Identity::load_or_create(&paths::lan_identity_path(config_dir)).map_err(files)?;
+    let book = PeerBook::load(&paths::lan_peers_path(config_dir)).map_err(files)?;
+    Ok(Box::new(lan::connect_paired(
+        lan_target(addr),
+        &identity,
+        CLIENT_NAME,
+        &book,
+    )?))
+}
+
+/// `pair <host[:port]> <code>`: trust that daemon from now on. Returns the exit code.
+pub fn pair_command(
+    args: &[String],
+    config_dir: &Path,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    let [addr, code] = args else {
+        return usage(err, "pair needs <host[:port]> and the one-time <code>");
+    };
+    let Some(code) = PairingCode::parse(code) else {
+        return usage(
+            err,
+            "the code is 16 letters and digits, like 7H2K-9QXM-04TD-VB3N",
+        );
+    };
+    let result = (|| -> ControlResult<_> {
+        let files = |e: std::io::Error| ControlError::Invalid(format!("keys: {e}"));
+        let identity =
+            Identity::load_or_create(&paths::lan_identity_path(config_dir)).map_err(files)?;
+        let mut book = PeerBook::load(&paths::lan_peers_path(config_dir)).map_err(files)?;
+        let daemon = lan::pair(lan_target(addr), &identity, CLIENT_NAME, &code)?;
+        book.add(daemon.clone()).map_err(files)?;
+        Ok(daemon)
+    })();
+    match result {
+        Ok(daemon) => {
+            let _ = writeln!(
+                out,
+                "paired with {:?} (key {}); use: router-cli --lan {addr} status",
+                daemon.name,
+                lan::fingerprint(&daemon.key)
+            );
+            EXIT_OK
+        }
+        Err(e) => {
+            let _ = writeln!(err, "router-cli: {e}");
+            EXIT_FAILED
+        }
+    }
+}
+// !SECTION: Another machine
 
 fn split_instance(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
     let mut instance = None;

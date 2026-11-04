@@ -390,6 +390,10 @@ pub struct LanRxConfig {
     pub source_ipv4: [u8; 4],
     pub stream_name: FixedStr<16>,
     pub buffer: NetworkBufferPreset,
+    /// Adaptive mode (PLAN §5.2 step 4, NOTES N3): `buffer` is the floor and the target rises
+    /// after repeated underruns, then falls back after a clean minute.
+    #[serde(default)]
+    pub adaptive: bool,
 }
 // !SECTION: LAN stream configuration (control plane)
 
@@ -637,6 +641,13 @@ pub enum EngineCommand {
     SetStripClock {
         strip: StripId,
         clock: ClockDomain,
+    },
+    /// Move the jitter target of a strip that is already on an external clock. Unlike
+    /// `SetStripClock` it does not reset the resampler or the learned drift, so a stream keeps
+    /// playing while the adaptive mode (N3) follows the network. Ignored on the master clock.
+    SetStripTarget {
+        strip: StripId,
+        target_ms: f32,
     },
     AttachBusOutput {
         bus: BusId,

@@ -9,6 +9,7 @@ use crate::testing::FakeDaemon;
 use crate::view::{PILLAR_W, STRIP_W};
 use app_core::types::{Command, PeerState};
 use app_core::ui_state::{GraphicsSettings, LayoutMode, UiMode};
+use audio_types::{FixedStr, SinkEndpoint};
 use egui::{Event, Modifiers, PointerButton, Pos2, ViewportId, ViewportInfo, vec2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
@@ -428,9 +429,425 @@ fn a_refused_command_shows_in_the_status_line() {
 }
 
 #[test]
-fn recording_is_offered_but_disabled_until_there_is_a_recorder() {
-    let (_fake, h) = expert();
-    let rec = h.get_by_label_contains("Record");
-    assert!(rec.accesskit_node().is_disabled());
+fn the_toolbar_record_button_waits_for_a_bus_with_an_output() {
+    let (fake, mut h) = expert();
+    assert!(
+        h.get_by_label("⏺ Record").accesskit_node().is_disabled(),
+        "no bus has an output yet"
+    );
+    fake.edit(|s| {
+        s.buses[0].config.sink = SinkEndpoint::HardwareOutput {
+            device_id: FixedStr::from_str_trunc("mock-out-1"),
+        };
+    });
+    advance(&mut h, 1.0);
+    let rec = h.get_by_label("⏺ Record");
+    assert!(!rec.accesskit_node().is_disabled());
+    fake.clear_commands();
+    rec.click();
+    h.run_steps(3);
+    assert!(
+        fake.commands().contains(&Command::BusRecord {
+            bus: 0,
+            enabled: true
+        }),
+        "{:?}",
+        fake.commands()
+    );
+}
+
+#[test]
+fn a_running_recording_shows_its_length_and_the_stop_button_stops_it() {
+    let (fake, mut h) = expert();
+    fake.edit(|s| {
+        s.buses[0].config.record = true;
+        s.buses[0].recording = Some(app_core::types::RecordingState {
+            path: "/tmp/take.wav".into(),
+            format: app_core::types::RecordFormat::Wav24,
+            frames: 48_000 * 75,
+            seconds: 75.0,
+            error: None,
+        });
+    });
+    advance(&mut h, 1.0);
+    let stop = h.get_by_label_contains("Stop recording 1:15");
+    fake.clear_commands();
+    stop.click();
+    h.run_steps(3);
+    assert!(
+        fake.commands().contains(&Command::BusRecord {
+            bus: 0,
+            enabled: false
+        }),
+        "{:?}",
+        fake.commands()
+    );
+}
+
+#[test]
+fn a_bus_has_its_own_record_button_and_shows_why_a_take_failed() {
+    let (fake, mut h) = expert();
+    h.get_by_label("Record bus 1").click();
+    h.run_steps(3);
+    assert!(fake.commands().contains(&Command::BusRecord {
+        bus: 0,
+        enabled: true
+    }));
+    fake.edit(|s| s.buses[1].record_error = Some("disk full".into()));
+    advance(&mut h, 2.0);
+    assert!(h.query_by_label_contains("disk full").is_some());
+}
+
+#[test]
+fn clock_text_is_minutes_and_seconds() {
+    use crate::toolbar::clock;
+    assert_eq!(clock(0.0), "0:00");
+    assert_eq!(clock(75.9), "1:15");
+    assert_eq!(clock(3_725.0), "1:02:05");
+    assert_eq!(clock(-3.0), "0:00");
 }
 // !SECTION: Other screens
+
+// SECTION: Patchbay Cards
+/// Expert mode, Patchbay layout, a wide window.
+fn patchbay() -> (Arc<FakeDaemon>, H) {
+    let fake = FakeDaemon::new();
+    fake.edit(|s| {
+        s.ui.mode = UiMode::Expert;
+        s.ui.layout = LayoutMode::PatchbayCards;
+    });
+    let h = harness_sized(&fake, 1200.0, 720.0);
+    (fake, h)
+}
+
+fn secondary_click(h: &mut H, pos: Pos2) {
+    pointer(h, Event::PointerMoved(pos));
+    for pressed in [true, false] {
+        pointer(
+            h,
+            Event::PointerButton {
+                pos,
+                button: PointerButton::Secondary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            },
+        );
+    }
+    h.run_steps(2);
+}
+
+fn routes(fake: &FakeDaemon) -> Vec<(u8, u8, bool)> {
+    fake.commands()
+        .into_iter()
+        .filter_map(|c| match c {
+            Command::Route { strip, bus, send } => Some((strip, bus, send.enabled)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_patchbay_toggle_is_live_and_draws_cards_with_sockets() {
+    let (fake, mut h) = expert();
+    h.get_by_label("Patchbay").click();
+    h.run_steps(3);
+    assert_eq!(fake.snapshot_now().ui.layout, LayoutMode::PatchbayCards);
+    for name in [
+        "Output socket strip 1",
+        "Output socket strip 4",
+        "Input socket bus 1",
+        "Input socket bus 3",
+        "Fader strip 1",
+        "Mute bus 1",
+    ] {
+        assert!(h.query_by_label(name).is_some(), "missing {name}");
+    }
+    // Sources on the left, buses on the right.
+    let src = h.get_by_label("Output socket strip 1").rect().center();
+    let bus = h.get_by_label("Input socket bus 1").rect().center();
+    assert!(src.x < bus.x - 100.0, "{src:?} {bus:?}");
+}
+
+#[test]
+fn a_card_has_mute_solo_and_a_fader_like_a_strip() {
+    let (fake, mut h) = patchbay();
+    h.get_by_label("Mute strip 2").click();
+    h.get_by_label("Solo strip 2").click();
+    h.get_by_label("Mute bus 2").click();
+    h.run_steps(2);
+    let cmds = fake.commands();
+    assert!(
+        cmds.contains(&Command::StripMute {
+            strip: 1,
+            mute: true
+        }),
+        "{cmds:?}"
+    );
+    assert!(
+        cmds.contains(&Command::StripSolo {
+            strip: 1,
+            solo: true
+        }),
+        "{cmds:?}"
+    );
+    assert!(
+        cmds.contains(&Command::BusMute { bus: 1, mute: true }),
+        "{cmds:?}"
+    );
+
+    // A key press on the focused fader moves it.
+    h.get_by_label("Fader strip 1").focus();
+    h.key_press(egui::Key::ArrowLeft);
+    h.run_steps(2);
+    assert!(!strip_gains(&fake, 0).is_empty(), "{:?}", fake.commands());
+}
+
+#[test]
+fn dragging_from_a_source_socket_to_a_bus_socket_makes_the_send() {
+    let (fake, mut h) = patchbay();
+    let from = h.get_by_label("Output socket strip 2").rect().center();
+    let to = h.get_by_label("Input socket bus 3").rect().center();
+    drag(&mut h, from, to);
+    assert_eq!(routes(&fake), vec![(1, 2, true)], "{:?}", fake.commands());
+    assert!(fake.snapshot_now().strips[1].config.sends[2].enabled);
+
+    // Dropping on empty space does nothing.
+    fake.clear_commands();
+    drag(&mut h, from, from + vec2(60.0, 200.0));
+    assert!(routes(&fake).is_empty());
+    assert!(!h.state().view.patch.busy(), "the gesture ended");
+}
+
+#[test]
+fn a_dropped_wire_keeps_the_sends_gain_and_a_live_send_is_left_alone() {
+    let (fake, mut h) = patchbay();
+    fake.edit(|s| {
+        s.strips[0].config.sends[1].enabled = false;
+        s.strips[0].config.sends[1].gain_db = -8.0;
+    });
+    advance(&mut h, 1.0);
+    let from = h.get_by_label("Output socket strip 1").rect().center();
+    let to = h.get_by_label("Input socket bus 2").rect().center();
+    drag(&mut h, from, to);
+    let s = fake.snapshot_now().strips[0].config.sends[1];
+    assert!(s.enabled && s.gain_db == -8.0, "{s:?}");
+    // Dropping on a bus that is already connected sends nothing.
+    fake.clear_commands();
+    drag(&mut h, from, to);
+    assert!(routes(&fake).is_empty());
+}
+
+#[test]
+fn right_clicking_a_wire_opens_its_gain_and_disconnect() {
+    let (fake, mut h) = patchbay();
+    fake.edit(|s| s.strips[0].config.sends[0].enabled = true);
+    advance(&mut h, 1.0);
+    assert!(h.query_by_label("Wire gain strip 1 bus 1").is_none());
+
+    let a = h.get_by_label("Output socket strip 1").rect().center();
+    let b = h.get_by_label("Input socket bus 1").rect().center();
+    let middle = crate::motion::bezier_at(&crate::motion::wire(a, b), 0.5);
+    secondary_click(&mut h, middle);
+    assert!(
+        h.query_by_label("Wire gain strip 1 bus 1").is_some(),
+        "the wire's gain did not open"
+    );
+
+    // A right-click away from every wire leaves the pick as it is.
+    let empty = middle + vec2(0.0, 150.0);
+    secondary_click(&mut h, empty);
+    // A plain click on empty space drops it.
+    press(&mut h, empty);
+    release(&mut h, empty);
+    h.run_steps(2);
+    assert!(h.query_by_label("Wire gain strip 1 bus 1").is_none());
+
+    // Pick it again and cut it.
+    secondary_click(&mut h, middle);
+    fake.clear_commands();
+    h.get_by_label("Disconnect strip 1 from bus 1").click();
+    h.run_steps(3);
+    assert_eq!(routes(&fake), vec![(0, 0, false)]);
+    assert!(
+        h.query_by_label("Wire gain strip 1 bus 1").is_none(),
+        "the bar closes"
+    );
+}
+
+#[test]
+fn the_expand_arrow_opens_the_cards_drawer_in_place() {
+    let (fake, mut h) = patchbay();
+    assert!(h.query_by_label("Send gain strip 1 bus 1").is_none());
+    let y2_before = h.get_by_label("Output socket strip 2").rect().center().y;
+    h.get_by_label("Expand card strip 1").click();
+    h.run_steps(3);
+    assert!(fake.snapshot_now().ui.strips[0].expanded_in_cards);
+    h.run_steps(180);
+    for name in [
+        "Send gain strip 1 bus 1",
+        "Send gain strip 1 bus 3",
+        "Pan strip 1",
+    ] {
+        assert!(h.query_by_label(name).is_some(), "missing {name}");
+    }
+    // Strip 2's card moved down to make room.
+    let y2 = h.get_by_label("Output socket strip 2").rect().center().y;
+    assert!(y2 > y2_before + 100.0, "strip 2 went {y2_before} -> {y2}");
+
+    // The drawer's send switch sends the route.
+    fake.clear_commands();
+    h.get_by_label("Send strip 1 to bus 2").click();
+    h.run_steps(2);
+    assert_eq!(routes(&fake), vec![(0, 1, true)]);
+
+    // The inspector opens beside the cards and the cards stay usable.
+    h.get_by_label("Open inspector strip 1").click();
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("Inspector strip 1").is_some());
+    assert!(h.query_by_label("Output socket strip 3").is_some());
+    h.get_by_label("Expand card strip 1").click();
+    h.run_steps(3);
+    assert!(!fake.snapshot_now().ui.strips[0].expanded_in_cards);
+}
+
+#[test]
+fn a_bus_card_has_a_drawer_with_its_output() {
+    let (fake, mut h) = patchbay();
+    h.get_by_label("Expand card bus 1").click();
+    h.run_steps(3);
+    assert!(fake.snapshot_now().ui.buses[0].expanded_in_cards);
+    assert!(h.query_by_label("Open inspector bus 1").is_some());
+}
+
+#[test]
+fn double_clicking_a_name_edits_it() {
+    let (fake, mut h) = patchbay();
+    let name = h.get_by_label("Name of strip 1");
+    name.click();
+    name.click();
+    h.run_steps(3);
+    let edit = h.get_by_label("Label of strip 1");
+    edit.focus();
+    h.run_steps(1);
+    // ? kittest 0.32 has no "key with modifiers" helper, so select-all is a raw event.
+    h.input_mut().events.push(Event::Key {
+        key: egui::Key::A,
+        physical_key: Some(egui::Key::A),
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::COMMAND,
+    });
+    h.run_steps(1);
+    h.get_by_label("Label of strip 1").type_text("Guitar");
+    h.run_steps(1);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    let sent = fake.commands().into_iter().find_map(|c| match c {
+        Command::StripLabel { strip: 0, label } => Some(label),
+        _ => None,
+    });
+    assert_eq!(sent.as_deref(), Some("Guitar"), "{:?}", fake.commands());
+    assert!(
+        h.query_by_label("Label of strip 1").is_none(),
+        "the box closed"
+    );
+}
+
+#[test]
+fn dragging_a_card_by_its_handle_reorders_the_cards() {
+    let (fake, mut h) = patchbay();
+    let handle = h.get_by_label("Move card strip 1").rect().center();
+    // Cards are 58 px apart; drag the first one below the second one's centre.
+    drag(&mut h, handle, handle + vec2(0.0, 80.0));
+    let layout = fake.snapshot_now().ui;
+    let orders: Vec<u8> = layout.strips.iter().map(|s| s.card_order).collect();
+    assert!(
+        orders[0] > orders[1],
+        "strip 1 should now come after strip 2: {orders:?}"
+    );
+    assert_eq!(orders[1], 0);
+    assert!(!h.state().view.patch.busy());
+    // Settled, strip 2 is above strip 1.
+    advance(&mut h, 3.0);
+    h.run_steps(180);
+    let y = |h: &H, n: u8| {
+        h.get_by_label(&format!("Output socket strip {n}"))
+            .rect()
+            .center()
+            .y
+    };
+    assert!(
+        y(&h, 2) < y(&h, 1),
+        "strip 2 {} above strip 1 {}",
+        y(&h, 2),
+        y(&h, 1)
+    );
+}
+
+#[test]
+fn rich_motion_springs_cards_to_their_new_place_and_eco_snaps() {
+    for (profile, animated) in [
+        (GraphicsSettings::RICH, true),
+        (GraphicsSettings::ECO, false),
+    ] {
+        let (fake, mut h) = patchbay();
+        fake.edit(|s| s.ui.graphics = Some(profile));
+        advance(&mut h, 1.0);
+        let y = |h: &H| h.get_by_label("Output socket strip 1").rect().center().y;
+        let before = y(&h);
+        // Another UI moved strip 1 to the bottom.
+        fake.edit(|s| {
+            s.ui.strips[0].card_order = 9;
+        });
+        h.state_mut().clock_override_s = Some(2.0);
+        h.step();
+        h.step();
+        let after_two_frames = y(&h);
+        h.run_steps(240);
+        let settled = y(&h);
+        assert!(
+            settled > before + 100.0,
+            "{profile:?}: strip 1 should be lower: {before} -> {settled}"
+        );
+        if animated {
+            assert!(
+                after_two_frames < settled - 20.0,
+                "Rich: still on its way: {after_two_frames} vs {settled}"
+            );
+        } else {
+            assert!(
+                (after_two_frames - settled).abs() < 1.0,
+                "Eco: already there: {after_two_frames} vs {settled}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_window_too_narrow_for_two_columns_shows_the_matrix() {
+    let fake = FakeDaemon::new();
+    fake.edit(|s| {
+        s.ui.mode = UiMode::Expert;
+        s.ui.layout = LayoutMode::PatchbayCards;
+    });
+    let h = harness_sized(&fake, 640.0, 600.0);
+    assert!(h.query_by_label_contains("showing the matrix").is_some());
+    assert!(h.query_by_label("Route strip 1 to bus 1").is_some());
+    assert!(h.query_by_label("Output socket strip 1").is_none());
+}
+
+#[test]
+fn the_patchbay_goes_quiet_when_minimized_like_every_other_view() {
+    let (_fake, mut h) = patchbay();
+    h.input_mut().viewports.insert(
+        ViewportId::ROOT,
+        ViewportInfo {
+            minimized: Some(true),
+            focused: Some(false),
+            ..Default::default()
+        },
+    );
+    h.step();
+    assert_eq!(h.state().last_decision.1, Repaint::None);
+}
+// !SECTION: Patchbay Cards

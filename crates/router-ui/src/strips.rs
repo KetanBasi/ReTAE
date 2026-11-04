@@ -458,16 +458,33 @@ fn bus_column(ui: &mut Ui, cx: &mut Ctx<'_>, i: usize, height: f32) {
                 mute: !cfg.mute,
             });
         }
-        // ? Recording is S9 (NOTES C4): the engine fills the recorder ring but nothing drains it.
-        // ? The button is shown so the layout is final, and disabled so it cannot promise a file.
-        let r = ui.add_enabled(false, small_button("Rec", None));
-        r.on_disabled_hover_text("Recording arrives in a later session");
+        let bus_state = &cx.snap.buses[i];
+        let r = ui.add(small_button("Rec", cfg.record.then_some(MUTE_COLOR)));
+        widgets::name(&r, WidgetType::Button, format!("Record bus {n}"));
+        let hover = match (&bus_state.recording, &bus_state.record_error) {
+            (_, Some(e)) => format!("Recording failed: {e}"),
+            (Some(rec), None) => format!("Recording to {}", rec.path),
+            (None, None) => "Record this bus to a file".to_owned(),
+        };
+        if r.on_hover_text(hover).clicked() {
+            cx.out.send(Command::BusRecord {
+                bus: i as u8,
+                enabled: !cfg.record,
+            });
+        }
     });
+    if let Some(e) = &cx.snap.buses[i].record_error {
+        ui.label(
+            RichText::new(truncate(e, 24))
+                .small()
+                .color(Color32::LIGHT_RED),
+        );
+    }
 }
 // !SECTION: Bus
 
 // SECTION: Pickers
-fn source_picker(ui: &mut Ui, cx: &mut Ctx<'_>, i: usize) {
+pub(crate) fn source_picker(ui: &mut Ui, cx: &mut Ctx<'_>, i: usize) {
     let cfg = cx.snap.strips[i].config;
     let current = cfg.source;
     let text = truncate(&describe_source(&current, cx.devices), 15);
@@ -551,6 +568,7 @@ fn source_picker(ui: &mut Ui, cx: &mut Ctx<'_>, i: usize) {
                 source_ipv4: [0, 0, 0, 0],
                 stream_name: FixedStr::from_str_trunc("Stream1"),
                 buffer: NetworkBufferPreset::Fast,
+                adaptive: false,
             };
             pick(
                 ui,
@@ -563,6 +581,7 @@ fn source_picker(ui: &mut Ui, cx: &mut Ctx<'_>, i: usize) {
                     source_ipv4: s.ip,
                     stream_name: FixedStr::from_str_trunc(&s.stream_name),
                     buffer: NetworkBufferPreset::Fast,
+                    adaptive: false,
                 });
                 let ch = u8::try_from(s.channels).unwrap_or(2).clamp(1, 8);
                 pick(
@@ -590,7 +609,7 @@ fn source_picker(ui: &mut Ui, cx: &mut Ctx<'_>, i: usize) {
     }
 }
 
-fn sink_picker(ui: &mut Ui, cx: &mut Ctx<'_>, b: usize) {
+pub(crate) fn sink_picker(ui: &mut Ui, cx: &mut Ctx<'_>, b: usize) {
     let cfg = cx.snap.buses[b].config;
     let current = cfg.sink;
     let text = truncate(&describe_sink(&current, cx.devices), 15);
@@ -691,7 +710,7 @@ fn heading(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).small().weak());
 }
 
-fn link_line(ui: &mut Ui, link: &LinkState) {
+pub(crate) fn link_line(ui: &mut Ui, link: &LinkState) {
     match link {
         LinkState::Idle => {
             ui.add_space(0.0);

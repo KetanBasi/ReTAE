@@ -350,6 +350,10 @@ fn lan_rx_inspector(ui: &mut Ui, cx: &mut Ctx<'_>, i: u8) {
             ui.add(DragValue::new(target_ms).range(2..=500).suffix(" ms"));
         });
     }
+    ui.checkbox(&mut rx.adaptive, "Adaptive").on_hover_text(
+        "Raise the delay when the stream keeps underrunning, lower it again after a clean \
+         minute. The preset above is the floor.",
+    );
     if rx.buffer == NetworkBufferPreset::VerySlow {
         ui.label(
             RichText::new("96 ms is over the 70 ms budget on its own.")
@@ -378,6 +382,7 @@ fn lan_rx_inspector(ui: &mut Ui, cx: &mut Ctx<'_>, i: u8) {
                     source_ipv4: a,
                     stream_name: FixedStr::from_str_trunc(name.trim()),
                     buffer: rx.buffer,
+                    adaptive: rx.adaptive,
                 };
                 let channels = cx.snap.strips[usize::from(i)].config.channels;
                 cx.out.send(Command::StripSource {

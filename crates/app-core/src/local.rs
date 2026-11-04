@@ -9,6 +9,7 @@ use crate::control::{ControlApi, ControlResult};
 use crate::paths;
 use crate::probe;
 use crate::profile::{self, NetworkProfile, Profile, default_bus, default_strip};
+use crate::recorder::{self, RecordFormat, Recorder};
 use crate::types::{
     BusState, Command, ControlError, DiscoveredState, DiscoveryState, EngineStatus, LanRxLevels,
     LinkState, MeterLevels, MeterSnapshot, PROTOCOL_VERSION, PeerState, PolicyState, ProbeReport,
@@ -24,8 +25,9 @@ use audio_types::{
     Telemetry, load_f32,
 };
 use net_vban::discovery::{Advert, Discovery};
+use net_vban::jitter::AdaptiveTarget;
 use net_vban::rx::{RxPolicy, RxSocket, StreamKey};
-use net_vban::service::{Identity, Service, TextCommand};
+use net_vban::service::{Identity, Service, TextCommand, TextSender};
 use net_vban::stream::{StreamCounters, StreamRx};
 use net_vban::tx::TxStream;
 use platform_io::{AppInfo, AudioBackend, AudioStream, Capabilities, ClosedPort, DeviceInfo};
@@ -46,6 +48,8 @@ const DISCOVERY_EVERY: Duration = Duration::from_millis(500);
 /// Peers answer one ping per 250 ms each; stay a little above that.
 const PING_SPACING: Duration = Duration::from_millis(300);
 const MAX_PINGS: u8 = 32;
+/// Longest remote command text we send (one VBAN-TEXT packet holds far more, this is a sanity cap).
+const MAX_PEER_TEXT: usize = 512;
 const MAX_CLICKS: u8 = 50;
 
 // SECTION: Configuration
@@ -61,6 +65,9 @@ pub struct DaemonConfig {
     /// Jitter-buffer target for hardware devices that are not the master clock.
     pub device_target_ms: f32,
     pub config_dir: PathBuf,
+    /// Where `Command::BusRecord` writes its files (created on first use).
+    pub recordings_dir: PathBuf,
+    pub record_format: RecordFormat,
 }
 
 impl Default for DaemonConfig {
@@ -71,6 +78,8 @@ impl Default for DaemonConfig {
             discovery: false,
             device_target_ms: 8.0,
             config_dir: paths::config_dir(),
+            recordings_dir: paths::recordings_dir(),
+            record_format: RecordFormat::default(),
         }
     }
 }
@@ -82,8 +91,70 @@ impl Default for DaemonConfig {
 enum StripLink {
     None,
     Device(Box<dyn AudioStream>),
-    Lan { key: StreamKey, slot: PortSlot },
+    Lan {
+        key: StreamKey,
+        slot: PortSlot,
+        tuner: LanTuner,
+    },
 }
+
+// SECTION: LAN target tuning
+/// Keeps the engine's jitter target equal to the receive stream's, and runs the adaptive mode.
+// ? The receive thread owns the jitter FIFO and knows the real target (preset, or 2 packets once
+// ? the packet size is learned, or the adaptive raise); the mixer's drift adapter needs the same
+// ? number to steer the FIFO fill toward. They agree at attach time only by luck of the packet
+// ? size, so the control plane re-sends the target whenever the stream's own figure moves.
+struct LanTuner {
+    counters: Arc<StreamCounters>,
+    adaptive: Option<AdaptiveTarget>,
+    /// The target the engine was last told, in ms.
+    sent_ms: f32,
+    started: Instant,
+}
+
+/// Highest target adaptive mode may reach (the "VerySlow" preset's 96 ms).
+const ADAPTIVE_MAX_MS: f32 = 96.0;
+
+impl LanTuner {
+    fn new(cfg: &audio_types::LanRxConfig, counters: Arc<StreamCounters>) -> Self {
+        let floor = f32::from(cfg.buffer.target_ms());
+        Self {
+            sent_ms: counters.target_ms(),
+            counters,
+            adaptive: cfg
+                .adaptive
+                .then(|| AdaptiveTarget::new(floor, ADAPTIVE_MAX_MS, 0.0)),
+            started: Instant::now(),
+        }
+    }
+
+    /// One look at the stream. Returns what to tell the receive thread and the engine.
+    fn poll(&mut self, underruns: u32) -> TunerAction {
+        let now = self.started.elapsed().as_secs_f64();
+        let override_ms = self
+            .adaptive
+            .as_mut()
+            .and_then(|a| a.update(now, underruns));
+        let t = self.counters.target_ms();
+        // ? 0 means the stream has not published a target yet.
+        let engine = (t > 0.0 && (t - self.sent_ms).abs() > 0.05).then(|| {
+            self.sent_ms = t;
+            t
+        });
+        TunerAction {
+            override_ms,
+            engine_ms: engine,
+        }
+    }
+}
+
+struct TunerAction {
+    /// New adaptive target for the receive thread.
+    override_ms: Option<f32>,
+    /// New target for the mixer's drift adapter.
+    engine_ms: Option<f32>,
+}
+// !SECTION: LAN target tuning
 
 enum BusLink {
     None,
@@ -101,6 +172,13 @@ struct BusSlot {
     config: BusConfig,
     link: BusLink,
     state: LinkState,
+    /// How many channels the mixer writes into this bus's rings. The engine only learns it from
+    /// `AttachBusOutput` (2 until then, and it keeps the last value after a detach), so the
+    /// recorder file is opened with this, not with `config.channels`.
+    engine_channels: u8,
+    recorder: Option<Recorder>,
+    /// Why the last attempt to start a recording failed, until the next attempt.
+    record_error: Option<String>,
 }
 
 struct PolicySetting {
@@ -119,6 +197,8 @@ struct Inner {
     buses: Vec<BusSlot>,
     rx: RxSocket,
     service: Service,
+    /// Opened on the first remote command (`Command::PeerText`).
+    text_sender: Option<TextSender>,
     discovery: Option<Discovery>,
     discovery_state: DiscoveryState,
     policy: PolicySetting,
@@ -245,12 +325,111 @@ impl Inner {
         })?;
         self.send(EngineCommand::SetBusMute { bus, mute: c.mute })?;
         self.send(EngineCommand::SetBusEq { bus, eq: c.eq })?;
-        self.send(EngineCommand::SetBusRecord {
-            bus,
-            enabled: c.record,
-        })
+        self.set_record(b, c.record)
     }
     // !SECTION: Engine commands
+
+    // SECTION: Recording
+    // ? The order matters at both ends. Starting: open the file and the writer thread first, then
+    // ? tell the mixer to fill the ring, so no block meets a ring nobody drains. Stopping: tell the
+    // ? mixer to stop first, then close the writer, so the ring is quiet when it is handed back.
+    fn set_record(&mut self, b: usize, enabled: bool) -> ControlResult<()> {
+        let bus = BusId(b as u8);
+        if enabled {
+            self.buses[b].config.record = true;
+            self.sync_recorder(b);
+            if self.buses[b].recorder.is_none() {
+                self.buses[b].config.record = false;
+                let why = self.buses[b].record_error.clone().unwrap_or_default();
+                let _ = self.send(EngineCommand::SetBusRecord {
+                    bus,
+                    enabled: false,
+                });
+                return Err(ControlError::Backend(why));
+            }
+            self.send(EngineCommand::SetBusRecord { bus, enabled: true })
+        } else {
+            self.buses[b].config.record = false;
+            let sent = self.send(EngineCommand::SetBusRecord {
+                bus,
+                enabled: false,
+            });
+            self.sync_recorder(b);
+            sent
+        }
+    }
+
+    /// Make the writer match `config.record` and the engine's channel count for bus `b`.
+    fn sync_recorder(&mut self, b: usize) {
+        let slot = &self.buses[b];
+        let mismatch = slot
+            .recorder
+            .as_ref()
+            .is_some_and(|r| r.channels() != slot.engine_channels);
+        if !slot.config.record || mismatch {
+            self.stop_recorder(b);
+        }
+        if self.buses[b].config.record && self.buses[b].recorder.is_none() {
+            self.start_recorder(b);
+        }
+    }
+
+    fn stop_recorder(&mut self, b: usize) {
+        let Some(rec) = self.buses[b].recorder.take() else {
+            return;
+        };
+        let (port, report) = rec.stop();
+        if let Some(port) = port {
+            self.ports.release_recorder(port);
+        }
+        // ? A take of zero frames (started, then stopped or re-opened with another channel count
+        // ? before any audio) is not worth keeping.
+        if report.frames == 0 && report.error.is_none() {
+            let _ = std::fs::remove_file(&report.path);
+        }
+        if let Some(e) = report.error {
+            self.buses[b].record_error = Some(format!("{}: {e}", report.path.display()));
+        }
+    }
+
+    fn start_recorder(&mut self, b: usize) {
+        let bus = BusId(b as u8);
+        let Some(port) = self.ports.acquire_recorder(bus) else {
+            self.buses[b].record_error =
+                Some("the recorder ring of this bus is not available".into());
+            return;
+        };
+        let slot = &self.buses[b];
+        let stem = format!(
+            "{}-bus{}-{}-{}",
+            recorder::file_safe(&self.cfg.name),
+            b + 1,
+            recorder::file_safe(slot.config.label.as_str()),
+            recorder::utc_stamp(),
+        );
+        let started = Recorder::start(
+            port,
+            &self.cfg.recordings_dir,
+            &stem,
+            self.cfg.record_format,
+            slot.engine_channels,
+            audio_types::ENGINE_SAMPLE_RATE,
+        );
+        match started {
+            Ok(rec) => {
+                self.buses[b].recorder = Some(rec);
+                self.buses[b].record_error = None;
+            }
+            Err((e, port)) => {
+                self.ports.release_recorder(port);
+                self.buses[b].record_error = Some(format!(
+                    "cannot record to {}: {e}",
+                    self.cfg.recordings_dir.display()
+                ));
+            }
+        }
+    }
+    // !SECTION: Recording
 
     // SECTION: Strip sources
     /// Close whatever feeds strip `i` and give its ring back to the pool.
@@ -265,7 +444,7 @@ impl Inner {
                     self.ports.release_input(port);
                 }
             }
-            StripLink::Lan { key, slot } => {
+            StripLink::Lan { key, slot, .. } => {
                 let _ = self.send(EngineCommand::DetachStripInput { strip });
                 if let Ok(Some(stream)) = self.rx.remove_stream(key) {
                     self.ports
@@ -319,8 +498,10 @@ impl Inner {
                     }
                     return Err(ControlError::Network(e.to_string()));
                 }
-                self.strips[i].link = StripLink::Lan { key, slot };
-                self.attach_strip(strip, slot, channels, counters.target_ms())
+                let tuner = LanTuner::new(&cfg, Arc::clone(&counters));
+                let first_target = tuner.sent_ms;
+                self.strips[i].link = StripLink::Lan { key, slot, tuner };
+                self.attach_strip(strip, slot, channels, first_target)
             }
             device_source => {
                 let port = self.ports.acquire_input().ok_or(ControlError::NoFreePort)?;
@@ -410,6 +591,8 @@ impl Inner {
         self.buses[b].config.sink = sink;
         self.buses[b].config.channels = channels;
         let result = self.try_open_bus(b, sink, channels);
+        // A new channel count means the recorder file must be re-opened with it.
+        self.sync_recorder(b);
         self.buses[b].state = match &result {
             Ok(()) if sink == SinkEndpoint::Unassigned => LinkState::Idle,
             Ok(()) => LinkState::Running,
@@ -431,6 +614,7 @@ impl Inner {
                 match TxStream::spawn(cfg, consumer, usize::from(channels)) {
                     Ok(tx) => {
                         self.buses[b].link = BusLink::Lan { tx, slot };
+                        self.buses[b].engine_channels = channels;
                         self.send(EngineCommand::AttachBusOutput {
                             bus,
                             slot,
@@ -455,6 +639,7 @@ impl Inner {
                 match self.backend.open_output(&device_sink, channels, port) {
                     Ok(stream) => {
                         self.buses[b].link = BusLink::Device(stream);
+                        self.buses[b].engine_channels = channels;
                         self.send(EngineCommand::AttachBusOutput {
                             bus,
                             slot,
@@ -470,6 +655,34 @@ impl Inner {
         }
     }
     // !SECTION: Bus sinks
+
+    // SECTION: LAN target tuning
+    /// Run each LAN strip's tuner: follow the receive thread's target in the mixer and drive the
+    /// adaptive mode. Called from the housekeeping thread.
+    fn tune_lan_targets(&mut self) {
+        let mut moves: Vec<(usize, StreamKey, TunerAction)> = Vec::new();
+        for i in 0..MAX_STRIPS {
+            let underruns = self.telemetry.lan_rx[i].underruns.load(Relaxed);
+            if let StripLink::Lan { key, tuner, .. } = &mut self.strips[i].link {
+                let act = tuner.poll(underruns);
+                if act.override_ms.is_some() || act.engine_ms.is_some() {
+                    moves.push((i, *key, act));
+                }
+            }
+        }
+        for (i, key, act) in moves {
+            if let Some(ms) = act.override_ms {
+                let _ = self.rx.set_target_override(key, Some(ms));
+            }
+            if let Some(ms) = act.engine_ms {
+                let _ = self.send(EngineCommand::SetStripTarget {
+                    strip: StripId(i as u8),
+                    target_ms: ms,
+                });
+            }
+        }
+    }
+    // !SECTION: LAN target tuning
 
     // SECTION: Network policy and discovery
     fn wanted_policy(&self) -> RxPolicy {
@@ -614,11 +827,7 @@ impl Inner {
             }
             Command::BusRecord { bus, enabled } => {
                 let b = bus_index(bus)?;
-                self.buses[b].config.record = enabled;
-                self.send(EngineCommand::SetBusRecord {
-                    bus: BusId(bus),
-                    enabled,
-                })
+                self.set_record(b, enabled)
             }
             Command::BusSink {
                 bus,
@@ -650,6 +859,7 @@ impl Inner {
                 self.service.ping(peer);
                 Ok(())
             }
+            Command::PeerText { peer, text } => self.send_peer_text(peer, &text),
             Command::Ui(layout) => {
                 self.ui = layout.sanitized();
                 Ok(())
@@ -689,6 +899,29 @@ impl Inner {
                 strip: index,
                 mute: muted,
             },
+            TextCommand::StripSolo { index, solo } => Command::StripSolo { strip: index, solo },
+            // ? VoiceMeeter's Pan_x runs -0.5..0.5, ours -1..1.
+            TextCommand::StripPan { index, pan_x } => Command::StripPan {
+                strip: index,
+                pan: pan_x * 2.0,
+            },
+            TextCommand::StripRoute { index, bus, on } => {
+                // Keep the send's gain and pre/post setting; only switch it on or off.
+                let Some(strip) = self.strips.get(usize::from(index)) else {
+                    return;
+                };
+                let Some(&current) = strip.config.sends.get(usize::from(bus)) else {
+                    return;
+                };
+                Command::Route {
+                    strip: index,
+                    bus,
+                    send: RouteSend {
+                        enabled: on,
+                        ..current
+                    },
+                }
+            }
             TextCommand::BusGain { index, db } => Command::BusGain {
                 bus: index,
                 gain_db: db,
@@ -699,6 +932,40 @@ impl Inner {
             },
         };
         let _ = self.apply(cmd);
+    }
+
+    /// Send VBAN-TEXT to a peer. Unicast only (CLAUDE.md law 3).
+    fn send_peer_text(&mut self, peer: SocketAddrV4, text: &str) -> ControlResult<()> {
+        let ip = *peer.ip();
+        if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || peer.port() == 0 {
+            return Err(ControlError::Invalid(
+                "a command goes to one machine: give a unicast address and port".into(),
+            ));
+        }
+        if text.trim().is_empty() || text.len() > MAX_PEER_TEXT {
+            return Err(ControlError::Invalid(format!(
+                "a remote command is 1 to {MAX_PEER_TEXT} bytes"
+            )));
+        }
+        if text
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+        {
+            return Err(ControlError::Invalid(
+                "a remote command is plain text".into(),
+            ));
+        }
+        if self.text_sender.is_none() {
+            let sender = TextSender::new(net_vban::service::TEXT_STREAM_NAME)
+                .map_err(|e| ControlError::Network(format!("cannot open a command socket: {e}")))?;
+            self.text_sender = Some(sender);
+        }
+        match self.text_sender.as_mut() {
+            Some(s) => s
+                .send_text(peer, text)
+                .map_err(|e| ControlError::Network(format!("cannot send to {peer}: {e}"))),
+            None => Err(ControlError::Network("no command socket".into())),
+        }
     }
     // !SECTION: Commands
 
@@ -940,10 +1207,14 @@ impl LocalControl {
                     config: default_bus(b),
                     link: BusLink::None,
                     state: LinkState::Idle,
+                    engine_channels: 2,
+                    recorder: None,
+                    record_error: None,
                 })
                 .collect(),
             rx,
             service,
+            text_sender: None,
             discovery,
             discovery_state,
             policy: PolicySetting {
@@ -1008,6 +1279,8 @@ impl Drop for LocalControl {
             inner.close_strip(i);
         }
         for b in 0..MAX_BUSES {
+            // Finalize any recording (headers, last block) before the rings go away.
+            inner.stop_recorder(b);
             inner.close_bus(b);
         }
     }
@@ -1041,6 +1314,7 @@ fn housekeeping(shared: &std::sync::Weak<Shared>, stop: &AtomicBool) {
         while let Some(event) = inner.service.try_recv_command() {
             inner.apply_text(event.command);
         }
+        inner.tune_lan_targets();
         if inner.last_discovery_poll.elapsed() >= DISCOVERY_EVERY {
             inner.last_discovery_poll = Instant::now();
             inner.poll_discovery();
@@ -1091,6 +1365,8 @@ impl ControlApi for LocalControl {
                     BusLink::Device(stream) => Some(stream.stats()),
                     _ => None,
                 },
+                recording: b.recorder.as_ref().map(Recorder::state),
+                record_error: b.record_error.clone(),
                 tx: match &b.link {
                     BusLink::Lan { tx, .. } => {
                         let s = tx.stats();
@@ -1330,3 +1606,56 @@ impl LocalControl {
     }
 }
 // !SECTION: ControlApi
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use audio_types::{LanRxConfig, NetworkBufferPreset};
+    use std::sync::atomic::Ordering;
+
+    fn tuner(adaptive: bool, preset: NetworkBufferPreset) -> (LanTuner, Arc<StreamCounters>) {
+        let counters = Arc::new(StreamCounters::default());
+        counters
+            .target_ms
+            .store(f32::from(preset.target_ms()).to_bits(), Ordering::Relaxed);
+        let cfg = LanRxConfig {
+            buffer: preset,
+            adaptive,
+            ..LanRxConfig::default()
+        };
+        (LanTuner::new(&cfg, Arc::clone(&counters)), counters)
+    }
+
+    #[test]
+    fn a_fixed_stream_never_gets_an_adaptive_override() {
+        let (mut t, _c) = tuner(false, NetworkBufferPreset::Fast);
+        for underruns in [0, 1, 5, 9] {
+            assert!(t.poll(underruns).override_ms.is_none());
+        }
+    }
+
+    #[test]
+    fn repeated_underruns_raise_the_target_of_an_adaptive_stream() {
+        let (mut t, _c) = tuner(true, NetworkBufferPreset::Fast);
+        assert!(t.poll(0).override_ms.is_none());
+        assert!(t.poll(1).override_ms.is_none(), "one underrun is tolerated");
+        let raised = t
+            .poll(2)
+            .override_ms
+            .expect("a second underrun inside a minute raises");
+        assert!(raised > 12.0 && raised <= ADAPTIVE_MAX_MS, "{raised}");
+    }
+
+    #[test]
+    fn the_engine_hears_about_every_change_of_the_streams_own_target() {
+        let (mut t, c) = tuner(false, NetworkBufferPreset::Optimal);
+        assert!(t.poll(0).engine_ms.is_none(), "nothing moved yet");
+        // The receive thread learned a 256-frame packet: two of them is 10.67 ms.
+        c.target_ms.store(10.667f32.to_bits(), Ordering::Relaxed);
+        assert_eq!(t.poll(0).engine_ms, Some(10.667));
+        assert!(t.poll(0).engine_ms.is_none(), "told once, not every tick");
+        // A target that has not been published yet (0) is not sent.
+        c.target_ms.store(0, Ordering::Relaxed);
+        assert!(t.poll(0).engine_ms.is_none());
+    }
+}

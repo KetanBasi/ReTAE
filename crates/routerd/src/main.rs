@@ -1,5 +1,6 @@
 //! `routerd`: the router daemon.
 
+use app_core::recorder::RecordFormat;
 use routerd::{BackendKind, Daemon, DaemonError, Options};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -27,6 +28,12 @@ OPTIONS:
     --config-dir <DIR>       where profiles are kept
     --profile <NAME>         load this profile at start
     --device-target-ms <MS>  buffer for non-master devices      (default: 8)
+    --recordings-dir <DIR>   where bus recordings go            (default: ~/Music/ReTAE)
+    --record-format <FMT>    wav16, wav24, wav32f or flac       (default: wav24)
+    --lan-control [PORT]     let paired devices control this mixer over the LAN,
+                             encrypted (default port: 6990; off unless given)
+    --pair                   with --lan-control: open a 5-minute pairing window and
+                             print its one-time code at start
     -h, --help               show this help
 ";
 
@@ -35,11 +42,29 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Options>, Stri
         backend: BackendKind::preferred(),
         ..Options::default()
     };
-    let mut args = args.into_iter();
+    let mut args = args.into_iter().peekable();
     while let Some(arg) = args.next() {
+        // ? `--lan-control` takes an optional port: look at the next word before consuming it.
+        if arg == "--lan-control" {
+            let port = match args.peek() {
+                Some(next) if !next.starts_with('-') => {
+                    let port = next
+                        .parse::<u16>()
+                        .ok()
+                        .filter(|p| *p != 0)
+                        .ok_or_else(|| "--lan-control needs a port from 1 to 65535".to_owned())?;
+                    args.next();
+                    port
+                }
+                _ => app_core::lan::DEFAULT_PORT,
+            };
+            o.lan_control = Some(port);
+            continue;
+        }
         let mut value = |what: &str| args.next().ok_or_else(|| format!("{arg} needs {what}"));
         match arg.as_str() {
             "-h" | "--help" => return Ok(None),
+            "--pair" => o.pair = true,
             "--name" => o.name = value("a name")?,
             "--backend" => o.backend = value("a backend")?.parse::<BackendKind>()?,
             "--port" => {
@@ -51,6 +76,12 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Options>, Stri
             "--instance" => o.instance = Some(value("a name")?),
             "--config-dir" => o.config_dir = PathBuf::from(value("a directory")?),
             "--profile" => o.profile = Some(value("a profile name")?),
+            "--recordings-dir" => o.recordings_dir = PathBuf::from(value("a directory")?),
+            "--record-format" => {
+                o.record_format = RecordFormat::parse(&value("a format")?).ok_or_else(|| {
+                    "--record-format is one of wav16, wav24, wav32f, flac".to_owned()
+                })?;
+            }
             "--device-target-ms" => {
                 o.device_target_ms = value("a number")?
                     .parse()
@@ -99,6 +130,15 @@ fn main() -> ExitCode {
         daemon.control().rx_port(),
         daemon.ipc_name()
     );
+    if let Some(addr) = daemon.lan_addr() {
+        println!("routerd: LAN control on TCP {addr} (encrypted; paired devices only)");
+    }
+    if let Some(code) = daemon.pairing_code() {
+        println!(
+            "routerd: pairing window open for 5 minutes. One-time code: {code}\n\
+             routerd: enter it on the controller; it works once and is forgotten."
+        );
+    }
     // The mixer thread reports within a moment whether it got real-time priority. Saying so
     // matters: without it audio still works, but a busy machine can cause dropouts.
     let report = daemon.master().stats().clone();
@@ -155,6 +195,25 @@ mod tests {
         assert!(o.discovery);
         assert_eq!(o.device_target_ms, 12.5);
         assert_eq!(o.profile.as_deref(), Some("stage"));
+    }
+
+    #[test]
+    fn lan_control_is_off_by_default_and_takes_an_optional_port() {
+        let off = parse(args(&[])).unwrap().unwrap();
+        assert_eq!((off.lan_control, off.pair), (None, false));
+        let default = parse(args(&["--lan-control"])).unwrap().unwrap();
+        assert_eq!(default.lan_control, Some(app_core::lan::DEFAULT_PORT));
+        // A flag after it is not mistaken for its port.
+        let o = parse(args(&["--lan-control", "--pair", "--name", "x"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(o.lan_control, Some(app_core::lan::DEFAULT_PORT));
+        assert!(o.pair);
+        assert_eq!(o.name, "x");
+        let o = parse(args(&["--lan-control", "7777"])).unwrap().unwrap();
+        assert_eq!(o.lan_control, Some(7777));
+        assert!(parse(args(&["--lan-control", "0"])).is_err());
+        assert!(parse(args(&["--lan-control", "http"])).is_err());
     }
 
     #[test]

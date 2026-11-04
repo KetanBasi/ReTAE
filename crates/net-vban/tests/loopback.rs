@@ -89,6 +89,7 @@ fn rx_with_stream(
         source_ipv4: LOOPBACK.octets(),
         stream_name: name(stream),
         buffer: preset,
+        adaptive: false,
     });
     let s = StreamRx::new(producer, CH, preset, counters.clone());
     if rx.add_stream(key, s).is_err() {

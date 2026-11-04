@@ -64,6 +64,8 @@ pub fn sample_snapshot() -> StateSnapshot {
                 link: LinkState::Idle,
                 stream: None,
                 tx: None,
+                recording: None,
+                record_error: None,
             })
             .collect(),
         policy: PolicyState {

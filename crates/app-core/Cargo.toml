@@ -16,3 +16,7 @@ toml.workspace = true
 postcard.workspace = true
 interprocess.workspace = true
 rtrb.workspace = true
+hound.workspace = true
+flacenc.workspace = true
+snow.workspace = true
+getrandom.workspace = true

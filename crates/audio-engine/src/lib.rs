@@ -44,8 +44,8 @@ pub use meter::{PEAK_FALL_DB_PER_S, RMS_TAU_MS};
 pub use mixmap::pan_gains;
 pub use params::{sanitize_band, sanitize_bands, sanitize_comp, sanitize_dsp, sanitize_gate};
 pub use ports::{
-    ControlPorts, EnginePorts, InputPort, MAX_PORTS, OutputPort, RecorderPort, create_port_pool,
-    input_slot, output_slot, recorder_slot,
+    ControlPorts, EnginePorts, InputPort, MAX_PORTS, OutputPort, PORT_RING_SAMPLES, RecorderPort,
+    create_port_pool, input_slot, output_slot, recorder_slot,
 };
 pub use stats::EngineStats;
 

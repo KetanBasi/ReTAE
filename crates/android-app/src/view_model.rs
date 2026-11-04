@@ -172,6 +172,7 @@ pub fn receive_commands(
                 source_ipv4: [0, 0, 0, 0],
                 stream_name: FixedStr::from_str_trunc(STREAM_NAME),
                 buffer,
+                adaptive: true,
             }),
             SinkEndpoint::HardwareOutput {
                 device_id: FixedStr::from_str_trunc(platform_io::android_rules::DEFAULT_DEVICE_ID),
@@ -410,6 +411,8 @@ mod tests {
             link: LinkState::Idle,
             stream: None,
             tx: None,
+            recording: None,
+            record_error: None,
         };
         StateSnapshot {
             protocol: 1,

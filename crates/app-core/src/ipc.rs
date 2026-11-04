@@ -189,14 +189,20 @@ fn accept_loop(listener: &Listener, control: &Weak<dyn ControlApi>, stop: &Atomi
 }
 
 fn serve(mut conn: Stream, control: &Weak<dyn ControlApi>) {
+    serve_stream(&mut conn, control);
+}
+
+/// Answer requests on any byte stream until it closes. The local socket and the encrypted LAN
+/// connection (`lan.rs`) share this loop, so both speak exactly the same protocol.
+pub(crate) fn serve_stream<S: Read + Write>(conn: &mut S, control: &Weak<dyn ControlApi>) {
     loop {
-        let request: Request = match read_frame(&mut conn) {
+        let request: Request = match read_frame(conn) {
             Ok(Some(r)) => r,
             Ok(None) | Err(_) => return,
         };
         let Some(control) = control.upgrade() else {
             let _ = write_frame(
-                &mut conn,
+                conn,
                 &Response::Error(ControlError::Disconnected(
                     "the daemon is shutting down".into(),
                 )),
@@ -205,7 +211,7 @@ fn serve(mut conn: Stream, control: &Weak<dyn ControlApi>) {
         };
         let response = handle(&*control, request);
         drop(control); // do not hold the engine alive while waiting for the next request
-        if write_frame(&mut conn, &response).is_err() {
+        if write_frame(conn, &response).is_err() {
             return;
         }
     }
@@ -233,9 +239,15 @@ fn handle(control: &dyn ControlApi, request: Request) -> Response {
 // !SECTION: Server
 
 // SECTION: Client
-/// A `ControlApi` that forwards to a daemon over IPC.
+/// Any byte stream a `RemoteControl` can run over (a local socket or the encrypted LAN link).
+pub(crate) trait Duplex: Read + Write + Send {}
+impl<T: Read + Write + Send> Duplex for T {}
+
+/// A `ControlApi` that forwards to a daemon over IPC (or, through `lan.rs`, over the LAN).
 pub struct RemoteControl {
-    conn: Mutex<Stream>,
+    // ? A boxed trait object, because the two transports are different types but the client
+    // ? code above them is identical.
+    conn: Mutex<Box<dyn Duplex>>,
 }
 
 impl RemoteControl {
@@ -244,6 +256,11 @@ impl RemoteControl {
         let conn = Stream::connect(n).map_err(|e| {
             ControlError::Disconnected(format!("cannot reach routerd ({name}): {e}"))
         })?;
+        Self::over(Box::new(conn))
+    }
+
+    /// Run the protocol over an already-open stream: the version handshake, then requests.
+    pub(crate) fn over(conn: Box<dyn Duplex>) -> ControlResult<Self> {
         let remote = Self {
             conn: Mutex::new(conn),
         };

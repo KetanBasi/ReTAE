@@ -4,7 +4,7 @@ use crate::governor::{Rate, Repaint, RepaintGovernor, WindowState};
 use crate::link::{self, Link, Session, Wake};
 use crate::model::{Conn, Model};
 use crate::view::{Ctx, NARROW_BELOW, Out, ViewState};
-use crate::{daemon, inspector, matrix, simple, strips, toolbar};
+use crate::{daemon, inspector, matrix, patchbay, simple, strips, toolbar};
 use app_core::ui_state::{GraphicsSettings, LayoutMode, UiMode};
 use egui::{Color32, RichText};
 use std::sync::Arc;
@@ -211,10 +211,7 @@ fn expert(ui: &mut egui::Ui, cx: &mut Ctx<'_>) {
     match cx.snap.ui.layout {
         LayoutMode::Matrix => matrix::matrix(ui, cx),
         LayoutMode::ConsoleStrips => strips::console(ui, cx),
-        LayoutMode::PatchbayCards => {
-            ui.label(RichText::new("Patchbay Cards are not built yet; showing the strips.").weak());
-            strips::console(ui, cx);
-        }
+        LayoutMode::PatchbayCards => patchbay::patchbay(ui, cx),
     }
 }
 

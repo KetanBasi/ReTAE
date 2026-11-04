@@ -462,6 +462,15 @@ impl MixerEngine {
                 store_f32(&lan.drift_ppm, 0.0);
                 lan.underruns.store(0, Ordering::Relaxed);
             }
+            C::SetStripTarget { strip, target_ms } => {
+                if !target_ms.is_finite() {
+                    bail!()
+                }
+                let Some(s) = self.strips.get_mut(strip.0 as usize) else {
+                    bail!()
+                };
+                s.set_target_ms(target_ms);
+            }
             C::AttachBusOutput {
                 bus,
                 slot,

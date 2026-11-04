@@ -14,6 +14,8 @@ pub mod inspector;
 pub mod link;
 pub mod matrix;
 pub mod model;
+pub mod motion;
+pub mod patchbay;
 pub mod simple;
 pub mod strips;
 pub mod toolbar;

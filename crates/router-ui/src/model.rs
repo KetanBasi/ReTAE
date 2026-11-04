@@ -118,6 +118,7 @@ pub fn apply_command(s: &mut StateSnapshot, cmd: &Command) {
         | Command::BusSink { .. }
         | Command::RxPolicy { .. }
         | Command::Ping { .. }
+        | Command::PeerText { .. }
         | Command::SaveProfile { .. }
         | Command::LoadProfile { .. }
         | Command::DeleteProfile { .. } => {}

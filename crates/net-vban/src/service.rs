@@ -345,13 +345,66 @@ pub fn parse_ping0(payload: &[u8]) -> PeerInfo {
 // !SECTION: Identity and PING0
 
 // SECTION: VBAN-TEXT
-/// The remote-control subset: `Strip[i].Gain/Mute` and `Bus[i].Gain/Mute` (PLAN.md §4.1).
+/// The remote-control subset (PLAN.md §4.1, NOTES N7): `Strip[i].Gain/Mute/Solo/Pan_x`,
+/// `Strip[i].A1..A5/B1..B3` (routing) and `Bus[i].Gain/Mute`.
+// ? VoiceMeeter's hardware outputs A1..A5 are `Bus[0..5]` and its virtual outputs B1..B3 are
+// ? `Bus[5..8]`; we use the same numbering, so `Strip[2].B1=1` sends strip 2 to our bus 5.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TextCommand {
-    StripGain { index: u8, db: f32 },
-    StripMute { index: u8, muted: bool },
-    BusGain { index: u8, db: f32 },
-    BusMute { index: u8, muted: bool },
+    StripGain {
+        index: u8,
+        db: f32,
+    },
+    StripMute {
+        index: u8,
+        muted: bool,
+    },
+    StripSolo {
+        index: u8,
+        solo: bool,
+    },
+    /// VoiceMeeter's `Pan_x`, -0.5 (left) to +0.5 (right). The mixer's own pan is -1..1.
+    StripPan {
+        index: u8,
+        pan_x: f32,
+    },
+    /// `bus` is 0..8: A1..A5, then B1..B3.
+    StripRoute {
+        index: u8,
+        bus: u8,
+        on: bool,
+    },
+    BusGain {
+        index: u8,
+        db: f32,
+    },
+    BusMute {
+        index: u8,
+        muted: bool,
+    },
+}
+
+/// `A1`..`A5`, `B1`..`B3` to a bus number (VoiceMeeter Potato layout).
+fn route_bus(name: &str) -> Option<u8> {
+    match name {
+        "a1" => Some(0),
+        "a2" => Some(1),
+        "a3" => Some(2),
+        "a4" => Some(3),
+        "a5" => Some(4),
+        "b1" => Some(5),
+        "b2" => Some(6),
+        "b3" => Some(7),
+        _ => None,
+    }
+}
+
+fn route_name(bus: u8) -> Option<String> {
+    match bus {
+        0..=4 => Some(format!("A{}", bus + 1)),
+        5..=7 => Some(format!("B{}", bus - 4)),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -412,6 +465,25 @@ fn parse_one(item: &str) -> Result<TextCommand, TextError> {
                 TextCommand::BusMute { index, muted }
             })
         }
+        "solo" if is_strip => Ok(TextCommand::StripSolo {
+            index,
+            solo: parse_bool(rhs).ok_or(TextError::BadValue)?,
+        }),
+        "pan_x" if is_strip => {
+            let v: f32 = rhs.parse().map_err(|_| TextError::BadValue)?;
+            if !v.is_finite() {
+                return Err(TextError::BadValue);
+            }
+            Ok(TextCommand::StripPan {
+                index,
+                pan_x: v.clamp(-0.5, 0.5),
+            })
+        }
+        other if is_strip && route_bus(other).is_some() => Ok(TextCommand::StripRoute {
+            index,
+            bus: route_bus(other).unwrap_or(0),
+            on: parse_bool(rhs).ok_or(TextError::BadValue)?,
+        }),
         _ => Err(TextError::Unknown),
     }
 }
@@ -430,6 +502,12 @@ impl TextCommand {
         match *self {
             Self::StripGain { index, db } => format!("Strip[{index}].Gain={db};"),
             Self::StripMute { index, muted } => format!("Strip[{index}].Mute={};", u8::from(muted)),
+            Self::StripSolo { index, solo } => format!("Strip[{index}].Solo={};", u8::from(solo)),
+            Self::StripPan { index, pan_x } => format!("Strip[{index}].Pan_x={pan_x};"),
+            // ? A bus beyond B3 has no VoiceMeeter name: an empty string, which `send_text` refuses.
+            Self::StripRoute { index, bus, on } => route_name(bus)
+                .map(|n| format!("Strip[{index}].{n}={};", u8::from(on)))
+                .unwrap_or_default(),
             Self::BusGain { index, db } => format!("Bus[{index}].Gain={db};"),
             Self::BusMute { index, muted } => format!("Bus[{index}].Mute={};", u8::from(muted)),
         }
@@ -483,6 +561,9 @@ impl TextSender {
     }
 
     pub fn send_text(&mut self, dest: SocketAddrV4, text: &str) -> io::Result<()> {
+        if text.trim().is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty command"));
+        }
         let pkt = build_text_packet(&self.stream, self.counter, text).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "text too long for one packet")
         })?;
@@ -1081,7 +1162,7 @@ mod tests {
     fn bad_commands_are_classified_and_do_not_stop_the_good_ones() {
         let results: Vec<_> = parse_commands(
             "Strip[16].Gain=0; Bus[16].Mute=1; Strip[0].Gain=nan; Strip[0].Gain=inf; Strip[0].Gain=abc; \
-             Strip[0].Mute=maybe; Strip[0].Solo=1; Patch[0]=1; Strip[0].Gain; Strip[x].Gain=0; Strip[1].Mute=1",
+             Strip[0].Mute=maybe; Strip[0].Comp=1; Patch[0]=1; Strip[0].Gain; Strip[x].Gain=0; Strip[1].Mute=1",
         )
         .collect();
         assert_eq!(
@@ -1119,6 +1200,34 @@ mod tests {
                 index: 1,
                 muted: false,
             },
+            TextCommand::StripSolo {
+                index: 4,
+                solo: true,
+            },
+            TextCommand::StripPan {
+                index: 1,
+                pan_x: -0.25,
+            },
+            TextCommand::StripRoute {
+                index: 2,
+                bus: 0,
+                on: true,
+            },
+            TextCommand::StripRoute {
+                index: 2,
+                bus: 4,
+                on: false,
+            },
+            TextCommand::StripRoute {
+                index: 7,
+                bus: 5,
+                on: true,
+            },
+            TextCommand::StripRoute {
+                index: 7,
+                bus: 7,
+                on: false,
+            },
         ] {
             assert_eq!(ok(&cmd.to_text()), [cmd], "{}", cmd.to_text());
         }
@@ -1126,6 +1235,73 @@ mod tests {
             TextCommand::StripGain { index: 0, db: -6.0 }.to_text(),
             "Strip[0].Gain=-6;"
         );
+    }
+
+    #[test]
+    fn solo_pan_and_routing_parse_like_voicemeeter_writes_them() {
+        assert_eq!(
+            ok("Strip[1].Solo=1; Strip[2].Pan_x=0.3; Strip[3].A1=1; Strip[3].B2=0; strip[0].b3=on"),
+            [
+                TextCommand::StripSolo {
+                    index: 1,
+                    solo: true
+                },
+                TextCommand::StripPan {
+                    index: 2,
+                    pan_x: 0.3
+                },
+                TextCommand::StripRoute {
+                    index: 3,
+                    bus: 0,
+                    on: true
+                },
+                TextCommand::StripRoute {
+                    index: 3,
+                    bus: 6,
+                    on: false
+                },
+                TextCommand::StripRoute {
+                    index: 0,
+                    bus: 7,
+                    on: true
+                },
+            ]
+        );
+        // Pan is clamped to VoiceMeeter's -0.5..0.5; these are strip-only properties.
+        assert_eq!(
+            ok("Strip[0].Pan_x=9")[0],
+            TextCommand::StripPan {
+                index: 0,
+                pan_x: 0.5
+            }
+        );
+        let bad: Vec<_> = parse_commands(
+            "Bus[0].Solo=1; Bus[0].A1=1; Strip[0].Pan_x=x; Strip[0].A6=1; Strip[0].A1=maybe",
+        )
+        .collect();
+        assert_eq!(
+            bad,
+            [
+                Err(TextError::Unknown),
+                Err(TextError::Unknown),
+                Err(TextError::BadValue),
+                Err(TextError::Unknown),
+                Err(TextError::BadValue),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_route_to_a_bus_without_a_voicemeeter_name_cannot_be_sent() {
+        let c = TextCommand::StripRoute {
+            index: 0,
+            bus: 9,
+            on: true,
+        };
+        assert_eq!(c.to_text(), "");
+        let mut s = TextSender::new("Command1").unwrap();
+        let dest = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9);
+        assert!(s.send_command(dest, &c).is_err());
     }
 
     #[test]

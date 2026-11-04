@@ -9,10 +9,12 @@
 
 pub mod control;
 pub mod ipc;
+pub mod lan;
 pub mod local;
 pub mod paths;
 pub mod probe;
 pub mod profile;
+pub mod recorder;
 pub mod types;
 pub mod ui_state;
 

@@ -22,13 +22,74 @@ pub fn toolbar(ui: &mut Ui, cx: &mut Ctx<'_>) {
         peers_menu(ui, cx);
         profile_menu(ui, cx);
         ui.separator();
-        // ? Disabled on purpose: nothing drains the recorder ring yet (NOTES C4, S9).
-        let rec = ui.add_enabled(false, Button::new("⏺ Record"));
-        rec.on_disabled_hover_text("Recording arrives in a later session");
+        record_button(ui, cx);
         ui.separator();
         engine_status(ui, cx);
     });
 }
+
+// SECTION: Record
+/// `m:ss` (or `h:mm:ss`) for a take length.
+pub fn clock(seconds: f32) -> String {
+    let s = seconds.max(0.0) as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+/// One button for the whole mixer: starts a take on every bus that has an output, or stops all
+/// the takes that are running. Per-bus control is the small `Rec` button on each bus.
+fn record_button(ui: &mut Ui, cx: &mut Ctx<'_>) {
+    let running: Vec<u8> = (0..cx.snap.buses.len())
+        .filter(|&b| cx.snap.buses[b].config.record)
+        .map(|b| b as u8)
+        .collect();
+    if !running.is_empty() {
+        let secs = cx
+            .snap
+            .buses
+            .iter()
+            .filter_map(|b| b.recording.as_ref())
+            .fold(0.0f32, |m, r| m.max(r.seconds));
+        let text =
+            RichText::new(format!("⏹ Stop recording {}", clock(secs))).color(Color32::LIGHT_RED);
+        if ui
+            .add(Button::new(text))
+            .on_hover_text("Stop every running recording")
+            .clicked()
+        {
+            for bus in running {
+                cx.out.send(Command::BusRecord {
+                    bus,
+                    enabled: false,
+                });
+            }
+        }
+        return;
+    }
+    let targets: Vec<u8> = (0..cx.snap.buses.len())
+        .filter(|&b| cx.snap.buses[b].config.sink != SinkEndpoint::Unassigned)
+        .map(|b| b as u8)
+        .collect();
+    let rec = ui.add_enabled(!targets.is_empty(), Button::new("⏺ Record"));
+    let hover = if targets.is_empty() {
+        "Give a bus an output first"
+    } else {
+        "Record every bus that has an output"
+    };
+    if rec
+        .on_hover_text(hover)
+        .on_disabled_hover_text(hover)
+        .clicked()
+    {
+        for bus in targets {
+            cx.out.send(Command::BusRecord { bus, enabled: true });
+        }
+    }
+}
+// !SECTION: Record
 
 fn mode_toggle(ui: &mut Ui, cx: &mut Ctx<'_>) {
     let mut mode = cx.snap.ui.mode;
@@ -43,11 +104,7 @@ fn layout_toggle(ui: &mut Ui, cx: &mut Ctx<'_>) {
     let mut layout = cx.snap.ui.layout;
     ui.selectable_value(&mut layout, LayoutMode::ConsoleStrips, "Strips");
     ui.selectable_value(&mut layout, LayoutMode::Matrix, "Matrix");
-    // ? Patchbay Cards are the polish phase (PLAN §9.4, S9). Shown so the toggle is final.
-    ui.add_enabled_ui(false, |ui| {
-        ui.selectable_value(&mut layout, LayoutMode::PatchbayCards, "Patchbay")
-            .on_disabled_hover_text("Arrives in a later session");
-    });
+    ui.selectable_value(&mut layout, LayoutMode::PatchbayCards, "Patchbay");
     if layout != cx.snap.ui.layout {
         cx.out.edit_layout(cx.snap, |l| l.layout = layout);
     }

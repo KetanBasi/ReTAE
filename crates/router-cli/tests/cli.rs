@@ -178,6 +178,104 @@ fn a_probe_without_a_peer_measures_only_the_local_pipeline() {
 }
 
 #[test]
+fn a_device_pairs_once_and_then_controls_the_daemon_over_the_lan() {
+    let dir = TempDir::new("lan-cli");
+    let daemon = Daemon::start(Options {
+        name: "daemon-lan-cli".into(),
+        rx_port: 0,
+        instance: Some(format!("cli-lan-{}", std::process::id())),
+        config_dir: dir.0.clone(),
+        lan_control: Some(0),
+        pair: true,
+        ..Options::default()
+    })
+    .unwrap();
+    let host = format!("127.0.0.1:{}", daemon.lan_addr().unwrap().port());
+    let code = daemon.pairing_code().unwrap().to_string();
+    // The controller keeps its keys in a directory of its own.
+    let mine = TempDir::new("lan-cli-me");
+    let words =
+        |line: &str| -> Vec<String> { line.split_whitespace().map(str::to_owned).collect() };
+
+    // A wrong code and a malformed one fail without storing anything.
+    for bad in ["0000-0000-0000-0000", "nope"] {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let status = router_cli::pair_command(
+            &words(&format!("{host} {bad}")),
+            &mine.0,
+            &mut out,
+            &mut err,
+        );
+        assert_ne!(status, router_cli::EXIT_OK, "{bad}");
+    }
+    assert!(!paths::lan_peers_path(&mine.0).exists());
+
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let status = router_cli::pair_command(
+        &words(&format!("{host} {code}")),
+        &mine.0,
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(
+        status,
+        router_cli::EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+    assert!(String::from_utf8(out).unwrap().contains("daemon-lan-cli"));
+
+    // `main` takes --lan out of the line and connects with the stored keys.
+    let (lan, rest) =
+        router_cli::split_lan(&words(&format!("--lan {host} route 0 1 on -6"))).unwrap();
+    assert_eq!(lan.as_deref(), Some(host.as_str()));
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let connect = |_: Option<&str>| router_cli::connect_lan(&host, &mine.0);
+    let status = router_cli::run(&rest, &mut out, &mut err, &connect);
+    assert_eq!(
+        status,
+        router_cli::EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+    let local = RemoteControl::connect(daemon.ipc_name()).unwrap();
+    let send = local.snapshot().unwrap().strips[0].config.sends[1];
+    assert!(send.enabled && send.gain_db == -6.0, "{send:?}");
+
+    // A device that never paired is told so.
+    let stranger = TempDir::new("lan-cli-stranger");
+    let err = router_cli::connect_lan(&host, &stranger.0)
+        .err()
+        .expect("must refuse");
+    assert!(
+        err.to_string().contains("not paired") || err.to_string().contains("pair"),
+        "{err}"
+    );
+}
+
+#[test]
+fn lan_arguments_are_split_off_before_the_command_is_read() {
+    let args = |s: &str| -> Vec<String> { s.split_whitespace().map(str::to_owned).collect() };
+    assert_eq!(
+        router_cli::split_lan(&args("status")).unwrap(),
+        (None, args("status"))
+    );
+    assert_eq!(
+        router_cli::split_lan(&args("--lan 10.0.0.2 status")).unwrap(),
+        (Some("10.0.0.2".to_owned()), args("status"))
+    );
+    assert!(router_cli::split_lan(&args("status --lan")).is_err());
+    let mut err = Vec::new();
+    let status = router_cli::pair_command(
+        &args("onlyonearg"),
+        &std::env::temp_dir(),
+        &mut Vec::new(),
+        &mut err,
+    );
+    assert_eq!(status, router_cli::EXIT_USAGE);
+}
+
+#[test]
 fn no_daemon_gives_a_clear_message_and_exit_code_one() {
     let (code, out, err) = cli("cli-nobody-home", "status");
     assert_eq!(code, router_cli::EXIT_FAILED);

@@ -103,6 +103,16 @@ impl Strip {
         }
     }
 
+    /// Follow a new jitter target without a reset (only meaningful on an external clock).
+    pub fn set_target_ms(&mut self, target_ms: f32) {
+        if let ClockDomain::External { .. } = self.clock {
+            self.adapter.set_target_ms(target_ms);
+            self.clock = ClockDomain::External {
+                target_ms: self.adapter.target_ms(),
+            };
+        }
+    }
+
     /// Mirror the adapter into the strip's LAN telemetry slot (4 relaxed stores).
     fn publish_clock(&self, lan: &LanRxAtomics) {
         store_f32(&lan.buffer_ms, self.adapter.fill_ms());
