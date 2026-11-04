@@ -19,7 +19,7 @@ USAGE:
 
 OPTIONS:
     --name <NAME>            name other machines see            (default: ReTAE)
-    --backend <KIND>         audio backend: mock, pipewire, alsa, auto
+    --backend <KIND>         audio backend: mock, pipewire, alsa, wasapi, auto
                              (default: auto if this build has a real backend, else mock)
     --port <PORT>            UDP port for VBAN audio            (default: 6980)
     --discovery              announce and browse over mDNS
@@ -163,6 +163,7 @@ mod tests {
             ("mock", BackendKind::Mock),
             ("pipewire", BackendKind::PipeWire),
             ("alsa", BackendKind::Alsa),
+            ("wasapi", BackendKind::Wasapi),
             ("auto", BackendKind::Auto),
         ] {
             let o = parse(args(&["--backend", name])).unwrap().unwrap();
@@ -179,7 +180,7 @@ mod tests {
         for bad in [
             &["--port"][..],
             &["--port", "99999"],
-            &["--backend", "wasapi"],
+            &["--backend", "coreaudio"],
             &["--device-target-ms", "0"],
             &["--device-target-ms", "nan"],
             &["--frobnicate"],

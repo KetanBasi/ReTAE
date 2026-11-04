@@ -29,7 +29,10 @@ pub enum BackendKind {
     PipeWire,
     /// Linux, ALSA through `cpal`. Needs the `alsa` feature. Hardware devices only.
     Alsa,
-    /// The best real backend this build has and this machine can reach: PipeWire, then ALSA.
+    /// Windows, WASAPI. Always built on Windows; needs the Windows audio service running.
+    Wasapi,
+    /// The best real backend this build has and this machine can reach: WASAPI on Windows,
+    /// PipeWire then ALSA on Linux.
     Auto,
 }
 
@@ -37,9 +40,12 @@ impl BackendKind {
     /// What `routerd` uses when no `--backend` is given: `auto` if the build has a real
     /// backend, otherwise `mock`.
     pub fn preferred() -> Self {
-        if cfg!(all(
-            target_os = "linux",
-            any(feature = "pipewire", feature = "alsa")
+        if cfg!(any(
+            windows,
+            all(
+                target_os = "linux",
+                any(feature = "pipewire", feature = "alsa")
+            )
         )) {
             Self::Auto
         } else {
@@ -52,6 +58,7 @@ impl BackendKind {
             Self::Mock => "mock",
             Self::PipeWire => "pipewire",
             Self::Alsa => "alsa",
+            Self::Wasapi => "wasapi",
             Self::Auto => "auto",
         }
     }
@@ -67,9 +74,10 @@ impl FromStr for BackendKind {
             "mock" => Ok(Self::Mock),
             "pipewire" => Ok(Self::PipeWire),
             "alsa" => Ok(Self::Alsa),
+            "wasapi" => Ok(Self::Wasapi),
             "auto" => Ok(Self::Auto),
             other => Err(format!(
-                "unknown backend {other:?} (mock, pipewire, alsa or auto)"
+                "unknown backend {other:?} (mock, pipewire, alsa, wasapi or auto)"
             )),
         }
     }
@@ -86,10 +94,15 @@ fn make_backend(
         }
         BackendKind::PipeWire => pipewire_backend().map(|b| (b, None)),
         BackendKind::Alsa => alsa_backend().map(|b| (b, None)),
+        BackendKind::Wasapi => wasapi_backend().map(|b| (b, None)),
         BackendKind::Auto => {
-            // ? PipeWire first: it can also make virtual devices and capture one program.
-            // ? ALSA is the fallback for a machine without a PipeWire server. Both errors are
-            // ? kept, so a person sees why neither worked.
+            // ? On Windows there is one choice. On Linux, PipeWire first: it can also make
+            // ? virtual devices and capture one program; ALSA is the fallback for a machine
+            // ? without a PipeWire server. Every error is kept, so a person sees why nothing
+            // ? worked.
+            if cfg!(windows) {
+                return wasapi_backend().map(|b| (b, None));
+            }
             match pipewire_backend() {
                 Ok(b) => Ok((b, None)),
                 Err(pw) => match alsa_backend() {
@@ -101,6 +114,20 @@ fn make_backend(
             }
         }
     }
+}
+
+#[cfg(windows)]
+fn wasapi_backend() -> Result<Box<dyn AudioBackend>, DaemonError> {
+    platform_io::WasapiBackend::connect(platform_io::WasapiOptions::default())
+        .map(|b| Box::new(b) as Box<dyn AudioBackend>)
+        .map_err(|e| DaemonError::Start(format!("cannot reach Windows audio: {e}")))
+}
+
+#[cfg(not(windows))]
+fn wasapi_backend() -> Result<Box<dyn AudioBackend>, DaemonError> {
+    Err(DaemonError::Start(
+        "WASAPI is only available on Windows".into(),
+    ))
 }
 
 #[cfg(all(target_os = "linux", feature = "pipewire"))]

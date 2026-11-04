@@ -9,6 +9,10 @@ run them and keep dates and versions, because VoiceMeeter and Windows change bet
 **Status: blocked on hardware.** It needs a Windows machine with VoiceMeeter and a Linux machine
 on the same LAN. The development container has neither, so nothing in this section is proven.
 
+The Windows side of ReTAE (S6, `--backend wasapi`) is just as unproven and shares this blocker, so
+the same session can also run the ReTAE ⇄ ReTAE and ReTAE ⇄ VoiceMeeter rows with ReTAE as the
+Windows endpoint. The Windows-only checklist is in `docs/windows-testing.md`.
+
 Setup:
 
 1. On Windows, in VoiceMeeter's VBAN window, add an incoming stream from the Linux machine's IP

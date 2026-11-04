@@ -22,6 +22,17 @@ pipewire = ["dep:pipewire"]
 alsa = ["dep:cpal"]
 rt = ["dep:audio_thread_priority"]
 
+# * Windows needs no feature: WASAPI is part of the OS and `wasapi` is pure Rust.
+[target.'cfg(windows)'.dependencies]
+wasapi.workspace = true
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",             # MMCSS (Av*), OpenProcess, QueryFullProcessImageNameW
+    "Win32_System_Diagnostics_ToolHelp",  # process list for parent-PID resolution
+    "Win32_System_SystemInformation",     # OSVERSIONINFOW
+    "Wdk_System_SystemServices",          # RtlGetVersion (the real build number)
+] }
+
 # ? Only the live PipeWire test uses rtrb directly (for the engine's command queue type).
 [dev-dependencies]
 rtrb.workspace = true

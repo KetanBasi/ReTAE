@@ -1,0 +1,19 @@
+[package]
+name = "router-tray"
+description = "Windows tray helper: starts the engine (routerd) and opens or closes the UI (router-ui)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+app-core.workspace = true
+
+# * The tray icon is Windows-only for now (S6). On Linux the binary only says so, which keeps
+# * `cargo test --workspace` free of GTK/appindicator system packages.
+[target.'cfg(windows)'.dependencies]
+tray-icon.workspace = true
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging", # the message loop a tray icon needs
+] }

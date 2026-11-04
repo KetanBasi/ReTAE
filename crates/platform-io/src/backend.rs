@@ -110,6 +110,12 @@ pub trait AudioStream: Send {
         false
     }
 
+    /// How the stream was opened, or why it stopped, in one line for diagnostics (for example
+    /// "shared, IAudioClient3 period 128 frames"). Empty when the backend has nothing to say.
+    fn detail(&self) -> String {
+        String::new()
+    }
+
     /// Stop the thread and hand the ring back to the pool.
     fn close(self: Box<Self>) -> Option<ClosedPort>;
 }

@@ -22,7 +22,15 @@ impl RtOutcome {
 
 /// Ask for real-time scheduling for the *calling* thread. `period_frames` is how much audio the
 /// thread produces per wake-up (the scheduler uses it to size the real-time budget).
-#[cfg(feature = "rt")]
+///
+/// On Windows this joins MMCSS as "Pro Audio" (the `rt` feature is not needed there, and the
+/// period is ignored: MMCSS sizes its budget from the task's registry settings).
+#[cfg(windows)]
+pub fn promote_current_thread(_period_frames: u32, _sample_rate: u32) -> RtOutcome {
+    crate::win::promote_current_thread_mmcss()
+}
+
+#[cfg(all(not(windows), feature = "rt"))]
 pub fn promote_current_thread(period_frames: u32, sample_rate: u32) -> RtOutcome {
     match audio_thread_priority::promote_current_thread_to_real_time(period_frames, sample_rate) {
         // ? The handle is only needed to *undo* the promotion. The thread keeps the priority
@@ -32,7 +40,7 @@ pub fn promote_current_thread(period_frames: u32, sample_rate: u32) -> RtOutcome
     }
 }
 
-#[cfg(not(feature = "rt"))]
+#[cfg(all(not(windows), not(feature = "rt")))]
 pub fn promote_current_thread(_period_frames: u32, _sample_rate: u32) -> RtOutcome {
     RtOutcome::Unavailable("built without the `rt` feature".into())
 }

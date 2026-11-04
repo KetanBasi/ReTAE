@@ -1,20 +1,28 @@
 //! Platform audio I/O: the `AudioBackend` trait, a mock backend for tests and headless runs,
-//! the timer-thread master clock, and the Linux backends (PipeWire, S5). WASAPI is S6 and
-//! AAudio S8.
+//! the timer-thread master clock, the Linux backends (PipeWire, ALSA; S5) and the Windows
+//! backend (WASAPI; S6). AAudio is S8.
 //!
 //! * The mixer never sees a device. A backend moves audio between a device and one of the
 //!   engine's pre-allocated port rings, and `app-core` owns the wiring (CLAUDE.md law 1).
 //! * Backends that bind a C library are cargo features and are off by default, so a plain
 //!   `cargo build` needs no system packages: `pipewire`, `alsa`, `rt` (see `Cargo.toml`).
+//!   The Windows backend needs no feature: it is pure Rust and only compiles on Windows.
 
-#![forbid(unsafe_code)]
+// ? `deny`, not `forbid`: the Windows module `win::sys` (MMCSS, OS build, process list) needs a
+// ? few `unsafe` calls and opts in with `#[allow(unsafe_code)]`. `forbid` cannot be overridden.
+#![deny(unsafe_code)]
 
 pub mod backend;
 pub mod clock;
 pub mod graph;
 pub mod master;
 pub mod mock;
+pub mod pcm;
 pub mod rt;
+pub mod win_rules;
+
+#[cfg(windows)]
+pub mod win;
 
 // ? Device callbacks shared by the Linux backends. It is compiled (and tested) in every build,
 // ? but PipeWire hands over bytes and ALSA hands over `f32` slices, so each backend leaves part
@@ -43,3 +51,5 @@ pub use mock::{Capture, MockBackend, MockControl, Signal};
 pub use alsa::{AlsaBackend, AlsaOptions};
 #[cfg(all(target_os = "linux", feature = "pipewire"))]
 pub use pw::{PipeWireBackend, PipeWireOptions};
+#[cfg(windows)]
+pub use win::{WasapiBackend, WasapiOptions};

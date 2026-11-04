@@ -10,6 +10,7 @@ members = [
     "crates/routerd",
     "crates/router-ui",
     "crates/router-cli",
+    "crates/router-tray",
     "crates/android-app",
 ]
 
@@ -58,6 +59,10 @@ cpal = { version = "0.18.2", default-features = false }
 audio_thread_priority = "0.38.0"
 # ? Windows-only: qWAVE QoS (IP_TOS is ignored by the Windows stack). Raw FFI, no `windows` crate.
 windows-sys = "0.61.2"
+# * S6 (Windows). `wasapi` wraps WASAPI incl. IAudioClient3 and process loopback; it is pure Rust
+# * (no C toolchain). tray-icon without default features: those only add GTK/xdo on Linux.
+wasapi = "0.26.0"
+tray-icon = { version = "0.24.2", default-features = false }
 # !SECTION: Workspace
 
 # SECTION: Profiles
