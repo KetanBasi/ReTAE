@@ -22,6 +22,7 @@ Update in place: delete an item when done and put the result where noted (intero
 - [ ] **Android (§12.1–3)**: playback-capture latency (click-loop probe), screen lock vs MediaProjection, OEM foreground-service kills; run `cargo test -p net-vban` on the device.
 - [ ] **Real pipeline latency**: the loopback test measured 24–30 ms (two Fast receive buffers, budget 70 ms) without devices, and `router-cli probe` measures the mixer path (C2) at ~8 ms for an 8 ms target. Device and OS buffers need the real backends (S5/S6, both written, neither measured on hardware); then run `router-cli probe <peer>` between two real machines.
 - [ ] **`router-cli probe <ip>` against a real VoiceMeeter** (VBAN-SERVICE round trip, under the §12.5 interop item), and against a ReTAE on another machine over wired and Wi-Fi.
+- [ ] **Desktop UI on a real display (S7, U1–U9)**: build `router-ui` on Windows and on Linux with a GPU; run Wayland and X11. Check what no headless test can: that the window looks right (fonts, spacing, a 4K or high-DPI screen), the Rich and Eco frame rates on a real GPU, and that a minimized window really stops repainting (watch CPU/GPU; Wayland gives no minimized hint, U4). Try the fader, the matrix drag, the inline send knob and the narrow layout by hand, and touch input on a touch screen. Run the tray's "Open UI" (W8) and "Start daemon" with a real `routerd`.
 - [ ] Re-run the 16×16 bench on the target PC and an Android ARM phone (E2).
 - [ ] Run `cargo test -p net-vban --test loopback -- --nocapture` on a real desktop: the mixer test should print no `NOTE: noisy host` and 0 underruns/overruns (N11).
 
@@ -38,9 +39,10 @@ Update in place: delete an item when done and put the result where noted (intero
 - [ ] Graceful "close UI" for the tray instead of `Child::kill` (W8, needs the shutdown command of C5).
 - [ ] Packet-phase-independent fill estimate for the drift controller (D1): a step/phase tracker; Optimal only.
 - [ ] Rebind sockets after errors (N5); per-interface beacon targets (N6).
-- [ ] Ring size versus 8-channel targets (E1); show rejected commands in the inspector (E4).
+- [ ] Ring size versus 8-channel targets (E1).
+- [ ] UI: Wi-Fi RSSI and link speed in the LAN inspector (needs a field in the snapshot, U8); a probe view (U8); choose the network buffer preset from measured jitter in Simple mode (U6, with N3).
 - [ ] `routerd` graceful shutdown on SIGTERM/Ctrl-C (C5).
 
 ## Planned (PLAN §11)
 - **S8**: the Android backend (C1); RT priority for the net threads there (N4: `THREAD_PRIORITY_URGENT_AUDIO`); open devices at 48 kHz (A2); a drift resampler on its bus outputs (C3, reuse `ring_io::PlaybackState`). (S6, the Windows side, is written; see the hardware item above.)
-- **S9**: adaptive target (N3), VBAN-TEXT remote control of VoiceMeeter peers (N7), Noise/`snow` pairing, FLAC/Opus recording (drain the recorder ring, C4), patchbay cards.
+- **S9**: adaptive target (N3), VBAN-TEXT remote control of VoiceMeeter peers (N7), Noise/`snow` pairing, FLAC/Opus recording (drain the recorder ring, C4), patchbay cards and the Record button (shown disabled until then, U7). (S7, the desktop UI, is written; see the display item above.)
