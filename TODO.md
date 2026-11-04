@@ -18,8 +18,13 @@ Update in place: delete an item when done and put the result where noted (intero
   - the tray: engine auto-start, open and close the UI, "Quit tray and engine" (W8); the privacy hint when the microphone is blocked in Windows settings;
   - unplugging a USB device or changing the default device while a stream is open (W6, P10).
 - [ ] **Wi-Fi**: real jitter and loss on 5 GHz; confirm the Fast (12 ms) and Medium (24 ms) presets; `WIFI_MODE_FULL_LOW_LATENCY` ping histogram with and without (§12.4).
-- [ ] **Discovery**: mDNS between two machines and through an access point (multicast filtering); fallback beacon against VoiceMeeter peers; Android `MulticastLock` (S8).
-- [ ] **Android (§12.1–3)**: playback-capture latency (click-loop probe), screen lock vs MediaProjection, OEM foreground-service kills; run `cargo test -p net-vban` on the device.
+- [ ] **Discovery**: mDNS between two machines and through an access point (multicast filtering); fallback beacon against VoiceMeeter peers; Android `MulticastLock` (not implemented, J7).
+- [ ] **Android (§12.1–3, S8; needs J5 and J6 first, otherwise nothing can be installed)**; the step-by-step list is `docs/android-testing.md`:
+  - playback-capture latency (click-loop probe), whether it opens at all, an app with capture disabled, the per-app filter (J2);
+  - screen lock vs MediaProjection on Android 15 QPR1+ and older: does the banner say "App audio paused — tap to resume" and does the microphone keep going; consent again after a stop (J3);
+  - OEM foreground-service kills with the screen off; the Wi-Fi low-latency lock effect on ping (§12.4);
+  - AAudio: which of exclusive/shared and which preset each phone gives (the stream `detail()` says), the mono microphone into a stereo strip, `VoicePerformance` latency, headset/USB/Bluetooth routes (J1);
+  - `Process.setThreadPriority` for the net threads (N4/J7); `cargo test -p net-vban` on the device.
 - [ ] **Real pipeline latency**: the loopback test measured 24–30 ms (two Fast receive buffers, budget 70 ms) without devices, and `router-cli probe` measures the mixer path (C2) at ~8 ms for an 8 ms target. Device and OS buffers need the real backends (S5/S6, both written, neither measured on hardware); then run `router-cli probe <peer>` between two real machines.
 - [ ] **`router-cli probe <ip>` against a real VoiceMeeter** (VBAN-SERVICE round trip, under the §12.5 interop item), and against a ReTAE on another machine over wired and Wi-Fi.
 - [ ] **Desktop UI on a real display (S7, U1–U9)**: build `router-ui` on Windows and on Linux with a GPU; run Wayland and X11. Check what no headless test can: that the window looks right (fonts, spacing, a 4K or high-DPI screen), the Rich and Eco frame rates on a real GPU, and that a minimized window really stops repainting (watch CPU/GPU; Wayland gives no minimized hint, U4). Try the fader, the matrix drag, the inline send knob and the narrow layout by hand, and touch input on a touch screen. Run the tray's "Open UI" (W8) and "Start daemon" with a real `routerd`.
@@ -42,7 +47,9 @@ Update in place: delete an item when done and put the result where noted (intero
 - [ ] Ring size versus 8-channel targets (E1).
 - [ ] UI: Wi-Fi RSSI and link speed in the LAN inspector (needs a field in the snapshot, U8); a probe view (U8); choose the network buffer preset from measured jitter in Simple mode (U6, with N3).
 - [ ] `routerd` graceful shutdown on SIGTERM/Ctrl-C (C5).
-
-## Planned (PLAN §11)
-- **S8**: the Android backend (C1); RT priority for the net threads there (N4: `THREAD_PRIORITY_URGENT_AUDIO`); open devices at 48 kHz (A2); a drift resampler on its bus outputs (C3, reuse `ring_io::PlaybackState`). (S6, the Windows side, is written; see the hardware item above.)
+- [ ] **Android, finish S8** (decisions for the owner are marked):
+  - **Get the Java into the APK (J5).** Decide: ask Makepad upstream, or write the post-build `uv run` script (javac + d8 + add dex + apksigner). Then `cargo makepad android build` must be shown to succeed; it has not been run.
+  - **Write the Makepad screen (J6)** over `android-app::view_model`: add `makepad-widgets` pinned to `60abec8b…` (Makepad 2.0 script DSL), call `glue::init` once the Activity exists, `glue::set_ui_visible` from the lifecycle, and draw `Screen` (Simple cards, banner, meters). The sandbox must be allowed to build Makepad's git checkout, or build it yourself.
+  - Battery-optimisation prompt and the OEM "don't kill my app" page (PLAN §6.3 step 6); `MulticastLock` while discovery runs (J7); an app picker in the Send card that uses `apps()` and `PlaybackCaptureFilter::OnlyUid`.
+  - Recording to `getExternalFilesDir` once the recorder ring has a consumer (J9, C4).
 - **S9**: adaptive target (N3), VBAN-TEXT remote control of VoiceMeeter peers (N7), Noise/`snow` pairing, FLAC/Opus recording (drain the recorder ring, C4), patchbay cards and the Record button (shown disabled until then, U7). (S7, the desktop UI, is written; see the display item above.)

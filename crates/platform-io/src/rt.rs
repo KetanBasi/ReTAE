@@ -30,7 +30,18 @@ pub fn promote_current_thread(_period_frames: u32, _sample_rate: u32) -> RtOutco
     crate::win::promote_current_thread_mmcss()
 }
 
-#[cfg(all(not(windows), feature = "rt"))]
+/// On Android this is `Process.setThreadPriority(THREAD_PRIORITY_URGENT_AUDIO)` through JNI; the
+/// period is ignored. It needs the JVM to be installed (`android::jvm::install`), else it reports
+/// why it could not.
+#[cfg(target_os = "android")]
+pub fn promote_current_thread(_period_frames: u32, _sample_rate: u32) -> RtOutcome {
+    match crate::android::jvm::set_urgent_audio_priority() {
+        Ok(()) => RtOutcome::Promoted,
+        Err(e) => RtOutcome::Unavailable(e.to_string()),
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "android"), feature = "rt"))]
 pub fn promote_current_thread(period_frames: u32, sample_rate: u32) -> RtOutcome {
     match audio_thread_priority::promote_current_thread_to_real_time(period_frames, sample_rate) {
         // ? The handle is only needed to *undo* the promotion. The thread keeps the priority
@@ -40,7 +51,7 @@ pub fn promote_current_thread(period_frames: u32, sample_rate: u32) -> RtOutcome
     }
 }
 
-#[cfg(all(not(windows), not(feature = "rt")))]
+#[cfg(all(not(windows), not(target_os = "android"), not(feature = "rt")))]
 pub fn promote_current_thread(_period_frames: u32, _sample_rate: u32) -> RtOutcome {
     RtOutcome::Unavailable("built without the `rt` feature".into())
 }

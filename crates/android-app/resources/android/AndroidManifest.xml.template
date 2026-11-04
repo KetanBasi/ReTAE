@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  * Replaces cargo-makepad's generated manifest (it uses `resources/android/AndroidManifest.xml.template`
+  * when the app crate ships one). `{token}` placeholders are filled in by cargo-makepad:
+  * {package_id} {label} {class_name} {min_sdk_version} {target_sdk_version} {version_code}
+  * {version_name} {debuggable}.
+  ? The launcher activity block mirrors what cargo-makepad writes at the pinned commit
+  ? (60abec8): without it the Makepad UI would not start. Re-diff it when the pin moves.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="{package_id}"
+    android:versionCode="{version_code}"
+    android:versionName="{version_name}">
+
+    <!-- PLAN.md §6.3 step 1 -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Expert option in the UI (PLAN.md §6.3 step 6). -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <uses-sdk
+        android:minSdkVersion="{min_sdk_version}"
+        android:targetSdkVersion="{target_sdk_version}" />
+    <uses-feature android:glEsVersion="0x00020000" android:required="true" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <!--
+      ? Since Android 11 an app sees only a few other packages. The per-app capture list is
+      ? "every app with a launcher icon", so ask for exactly that and not QUERY_ALL_PACKAGES
+      ? (which Google Play restricts).
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
+    <application
+        android:label="{label}"
+        android:hardwareAccelerated="true"
+        android:theme="@style/MakepadAppTheme"
+        android:allowBackup="false"
+        android:supportsRtl="true"
+        android:debuggable="{debuggable}"
+        android:enableOnBackInvokedCallback="true">
+
+        <!-- ? Without this the system letterboxes every phone taller than its default aspect. -->
+        <meta-data android:name="android.max_aspect" android:value="3.0" />
+
+        <activity
+            android:name=".{class_name}"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboard|keyboardHidden|navigation|touchscreen|uiMode|colorMode|locale|layoutDirection|fontScale|fontWeightAdjustment|mcc|mnc"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustNothing|stateUnchanged"
+            android:theme="@style/MakepadLaunchTheme">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- The screen-capture consent dialog and the runtime-permission prompts. -->
+        <activity
+            android:name="dev.f.lanrouter.ProjectionConsentActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!--
+          !! `mediaProjection` in this list is only *allowed*; the service starts with `microphone`
+          !! alone and adds the projection type after the consent (lifecycle.rs).
+        -->
+        <service
+            android:name="dev.f.lanrouter.AudioEngineService"
+            android:exported="false"
+            android:foregroundServiceType="microphone|mediaProjection" />
+    </application>
+</manifest>

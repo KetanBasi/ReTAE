@@ -33,6 +33,12 @@ windows-sys = { workspace = true, features = [
     "Wdk_System_SystemServices",          # RtlGetVersion (the real build number)
 ] }
 
+# * Android: AAudio (mic, output) through `ndk`, and playback capture through Java's
+# * `AudioRecord` over `jni` (AAudio cannot do it, PLAN §6.3). Neither needs a C toolchain.
+[target.'cfg(target_os = "android")'.dependencies]
+ndk.workspace = true
+jni.workspace = true
+
 # ? Only the live PipeWire test uses rtrb directly (for the engine's command queue type).
 [dev-dependencies]
 rtrb.workspace = true

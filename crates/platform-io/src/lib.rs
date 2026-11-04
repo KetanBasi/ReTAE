@@ -12,6 +12,7 @@
 // ? few `unsafe` calls and opts in with `#[allow(unsafe_code)]`. `forbid` cannot be overridden.
 #![deny(unsafe_code)]
 
+pub mod android_rules;
 pub mod backend;
 pub mod clock;
 pub mod graph;
@@ -23,6 +24,11 @@ pub mod win_rules;
 
 #[cfg(windows)]
 pub mod win;
+
+// ? `deny(unsafe_code)` stays for the crate. The Android modules opt in file by file
+// ? (`#![allow(unsafe_code)]`) only where a raw AAudio buffer or a JNI direct buffer is read.
+#[cfg(target_os = "android")]
+pub mod android;
 
 // ? Device callbacks shared by the Linux backends. It is compiled (and tested) in every build,
 // ? but PipeWire hands over bytes and ALSA hands over `f32` slices, so each backend leaves part
@@ -49,6 +55,8 @@ pub use mock::{Capture, MockBackend, MockControl, Signal};
 
 #[cfg(all(target_os = "linux", feature = "alsa"))]
 pub use alsa::{AlsaBackend, AlsaOptions};
+#[cfg(target_os = "android")]
+pub use android::{AndroidBackend, AndroidOptions};
 #[cfg(all(target_os = "linux", feature = "pipewire"))]
 pub use pw::{PipeWireBackend, PipeWireOptions};
 #[cfg(windows)]

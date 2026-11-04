@@ -1,6 +1,6 @@
 [package]
 name = "android-app"
-description = "Makepad UI + JNI glue for Android (stub until S8)"
+description = "Android host: foreground-service lifecycle, JNI glue and the in-process engine (the Makepad screen is a separate step)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,3 +12,12 @@ publish.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+audio-types.workspace = true
+audio-engine.workspace = true
+app-core.workspace = true
+net-vban.workspace = true
+platform-io.workspace = true
+
+# ? Only the Android glue talks JNI. On the host nothing links `jni`, so `cargo test` stays light.
+[target.'cfg(target_os = "android")'.dependencies]
+jni.workspace = true
